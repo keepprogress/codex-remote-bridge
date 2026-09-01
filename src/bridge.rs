@@ -1,0 +1,981 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use anyhow::{Context, Result, anyhow};
+use codex_app_server_protocol::{
+    JSONRPCError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, RequestId,
+};
+use codex_app_server_transport::ConnectionId;
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, oneshot};
+use tokio::time::{Duration, timeout};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::acp::AcpClient;
+use crate::approval::{acp_permission_result, permission_kind, permission_title};
+use crate::rpc::{
+    RemoteWriter, now_millis, now_seconds, send_error, send_notification, send_response,
+    send_server_request, trace_summary,
+};
+use crate::state::{PersistedState, PersistedThread, StateStore};
+
+struct PendingMobileRequest {
+    connection_id: ConnectionId,
+    sender: oneshot::Sender<Value>,
+}
+
+pub struct Bridge {
+    acp: AcpClient,
+    workspace: PathBuf,
+    model: String,
+    store: StateStore,
+    state: Mutex<PersistedState>,
+    mobile_requests: Mutex<HashMap<String, PendingMobileRequest>>,
+    next_mobile_id: AtomicI64,
+    trace_wire: bool,
+}
+
+impl Bridge {
+    pub async fn new(
+        acp: AcpClient,
+        workspace: PathBuf,
+        model: String,
+        store: StateStore,
+        trace_wire: bool,
+    ) -> Result<Self> {
+        let state = store.load().await?;
+        Ok(Self {
+            acp,
+            workspace,
+            model,
+            store,
+            state: Mutex::new(state),
+            mobile_requests: Mutex::new(HashMap::new()),
+            next_mobile_id: AtomicI64::new(1_000_000),
+            trace_wire,
+        })
+    }
+
+    pub async fn handle(
+        self: &Arc<Self>,
+        connection_id: ConnectionId,
+        message: JSONRPCMessage,
+        writer: RemoteWriter,
+    ) {
+        if self.trace_wire
+            && let Ok(value) = serde_json::to_value(&message)
+        {
+            info!(wire = %trace_summary("remote->bridge", &value));
+        }
+
+        let result = match message {
+            JSONRPCMessage::Request(request) => {
+                self.handle_request(connection_id, request, writer.clone())
+                    .await
+            }
+            JSONRPCMessage::Notification(notification) => {
+                self.handle_notification(notification).await
+            }
+            JSONRPCMessage::Response(response) => {
+                self.resolve_mobile_request(response.id, response.result)
+                    .await;
+                Ok(())
+            }
+            JSONRPCMessage::Error(error) => {
+                self.resolve_mobile_error(error).await;
+                Ok(())
+            }
+        };
+        if let Err(err) = result {
+            error!(%err, "bridge failed to handle remote message");
+        }
+    }
+
+    async fn handle_notification(&self, notification: JSONRPCNotification) -> Result<()> {
+        match notification.method.as_str() {
+            "initialized" => Ok(()),
+            method => {
+                warn!(method, "ignored unsupported client notification");
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_request(
+        self: &Arc<Self>,
+        connection_id: ConnectionId,
+        request: JSONRPCRequest,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let id = request.id;
+        let params = request.params.unwrap_or_else(|| json!({}));
+        match request.method.as_str() {
+            "initialize" => {
+                send_response(
+                    &writer,
+                    id,
+                    json!({
+                        "userAgent": format!("codex-remote-bridge/{}", crate::BRIDGE_VERSION)
+                    }),
+                )
+                .await
+            }
+            "thread/start" => self.thread_start(id, writer).await,
+            "thread/resume" => self.thread_resume(id, params, writer).await,
+            "thread/read" => self.thread_read(id, params, writer).await,
+            "thread/list" => self.thread_list(id, writer).await,
+            "turn/start" => {
+                self.turn_start(connection_id, id, params, writer).await
+            }
+            "turn/interrupt" => self.turn_interrupt(id, params, writer).await,
+            "turn/steer" => {
+                send_error(
+                    &writer,
+                    id,
+                    -32_001,
+                    "turn/steer is unavailable because ACP v1 has no steering primitive",
+                )
+                .await
+            }
+            "model/list" => {
+                send_response(
+                    &writer,
+                    id,
+                    json!({
+                        "data": [{
+                            "id": self.model,
+                            "model": self.model,
+                            "displayName": format!("Cursor {}", self.model),
+                            "description": "Cursor model pinned by codex-remote-bridge",
+                            "supportedReasoningEfforts": [],
+                            "defaultReasoningEffort": null,
+                            "isDefault": true
+                        }],
+                        "nextCursor": null
+                    }),
+                )
+                .await
+            }
+            "skills/list" | "app/list" | "mcpServer/list" => {
+                send_response(&writer, id, json!({"data": [], "nextCursor": null})).await
+            }
+            "config/read" => {
+                send_response(
+                    &writer,
+                    id,
+                    json!({
+                        "config": {
+                            "model": self.model,
+                            "cwd": self.workspace,
+                            "approvalPolicy": "on-request",
+                            "sandboxMode": "workspace-write"
+                        },
+                        "origins": {}
+                    }),
+                )
+                .await
+            }
+            method => {
+                warn!(method, "remote client called unsupported method");
+                send_error(
+                    &writer,
+                    id,
+                    -32_601,
+                    format!("method not implemented by Cursor ACP bridge: {method}"),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn thread_start(&self, id: RequestId, writer: RemoteWriter) -> Result<()> {
+        let session_id = self.acp.new_session(&self.workspace).await?;
+        let thread_id = Uuid::now_v7().to_string();
+        let now = now_seconds();
+        {
+            let mut state = self.state.lock().await;
+            state.threads.insert(
+                thread_id.clone(),
+                PersistedThread {
+                    acp_session_id: session_id,
+                    workspace: self.workspace.clone(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            self.store.save(&state).await?;
+        }
+        let thread = self.thread_json(&thread_id, false).await?;
+        send_response(
+            &writer,
+            id,
+            json!({
+                "thread": thread,
+                "model": self.model,
+                "modelProvider": "cursor",
+                "serviceTier": null,
+                "cwd": self.workspace,
+                "runtimeWorkspaceRoots": [self.workspace],
+                "instructionSources": [],
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite"},
+                "activePermissionProfile": null,
+                "reasoningEffort": null,
+                "multiAgentMode": "explicitRequestOnly"
+            }),
+        )
+        .await?;
+        send_notification(&writer, "thread/started", json!({"thread": thread})).await
+    }
+
+    async fn thread_resume(
+        &self,
+        id: RequestId,
+        params: Value,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let thread_id = required_string(&params, "threadId")?;
+        let persisted = self.persisted_thread(&thread_id).await?;
+        if self
+            .acp
+            .load_session(&persisted.acp_session_id, &persisted.workspace)
+            .await
+            .is_err()
+        {
+            let new_session = self.acp.new_session(&persisted.workspace).await?;
+            let mut state = self.state.lock().await;
+            let thread = state
+                .threads
+                .get_mut(&thread_id)
+                .context("thread disappeared while resuming")?;
+            thread.acp_session_id = new_session;
+            thread.updated_at = now_seconds();
+            self.store.save(&state).await?;
+        }
+        let thread = self.thread_json(&thread_id, true).await?;
+        send_response(&writer, id, json!({"thread": thread})).await
+    }
+
+    async fn thread_read(
+        &self,
+        id: RequestId,
+        params: Value,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let thread_id = required_string(&params, "threadId")?;
+        let include_turns = params
+            .get("includeTurns")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let thread = self.thread_json(&thread_id, include_turns).await?;
+        send_response(&writer, id, json!({"thread": thread})).await
+    }
+
+    async fn thread_list(&self, id: RequestId, writer: RemoteWriter) -> Result<()> {
+        let ids = {
+            let state = self.state.lock().await;
+            let mut ids: Vec<_> = state.threads.keys().cloned().collect();
+            ids.sort();
+            ids
+        };
+        let mut data = Vec::with_capacity(ids.len());
+        for thread_id in ids {
+            data.push(self.thread_json(&thread_id, false).await?);
+        }
+        send_response(&writer, id, json!({"data": data, "nextCursor": null})).await
+    }
+
+    async fn turn_start(
+        self: &Arc<Self>,
+        connection_id: ConnectionId,
+        id: RequestId,
+        params: Value,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let thread_id = required_string(&params, "threadId")?;
+        let persisted = self.persisted_thread(&thread_id).await?;
+        let prompt = extract_prompt(&params)?;
+        let turn_id = Uuid::now_v7().to_string();
+        let turn = turn_json(&turn_id, "inProgress", None);
+        send_response(&writer, id, json!({"turn": turn})).await?;
+        send_notification(
+            &writer,
+            "turn/started",
+            json!({"threadId": thread_id, "turn": turn}),
+        )
+        .await?;
+
+        let user_item = json!({
+            "type": "userMessage",
+            "id": Uuid::now_v7().to_string(),
+            "clientId": params.get("clientUserMessageId").cloned().unwrap_or(Value::Null),
+            "content": params.get("input").cloned().unwrap_or_else(|| json!([]))
+        });
+        send_notification(
+            &writer,
+            "item/started",
+            json!({
+                "item": user_item,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "startedAtMs": now_millis()
+            }),
+        )
+        .await?;
+        send_notification(
+            &writer,
+            "item/completed",
+            json!({
+                "item": user_item,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "completedAtMs": now_millis()
+            }),
+        )
+        .await?;
+
+        let bridge = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = bridge
+                .run_turn(
+                    connection_id,
+                    persisted.acp_session_id,
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    prompt,
+                    writer.clone(),
+                )
+                .await
+            {
+                error!(%err, %thread_id, %turn_id, "Cursor turn failed");
+                let failed = turn_json(&turn_id, "failed", Some(err.to_string()));
+                let _ = send_notification(
+                    &writer,
+                    "turn/completed",
+                    json!({"threadId": thread_id, "turn": failed}),
+                )
+                .await;
+            }
+        });
+        Ok(())
+    }
+
+    async fn run_turn(
+        &self,
+        connection_id: ConnectionId,
+        session_id: String,
+        thread_id: String,
+        turn_id: String,
+        prompt: String,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let mut events = self.acp.subscribe();
+        let prompt_request = self.acp.request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}]
+            }),
+        );
+        tokio::pin!(prompt_request);
+
+        let agent_item_id = Uuid::now_v7().to_string();
+        let reasoning_item_id = Uuid::now_v7().to_string();
+        let mut agent_started = false;
+        let mut reasoning_started = false;
+        let mut agent_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut tools: HashMap<String, Value> = HashMap::new();
+
+        let prompt_result = loop {
+            tokio::select! {
+                result = &mut prompt_request => break result,
+                event = events.recv() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            warn!(count, "Cursor ACP event receiver lagged");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(anyhow!("Cursor ACP event stream closed"));
+                        }
+                    };
+                    if event.pointer("/params/sessionId").and_then(Value::as_str) != Some(&session_id) {
+                        continue;
+                    }
+                    match event.get("method").and_then(Value::as_str) {
+                        Some("session/update") => {
+                            let update = event.pointer("/params/update").cloned().unwrap_or(Value::Null);
+                            self.handle_session_update(
+                                &writer,
+                                &thread_id,
+                                &turn_id,
+                                &agent_item_id,
+                                &reasoning_item_id,
+                                &mut agent_started,
+                                &mut reasoning_started,
+                                &mut agent_text,
+                                &mut reasoning_text,
+                                &mut tools,
+                                update,
+                            ).await?;
+                        }
+                        Some("session/request_permission") => {
+                            self.handle_permission(
+                                connection_id,
+                                &writer,
+                                &thread_id,
+                                &turn_id,
+                                &event,
+                            ).await?;
+                        }
+                        Some("cursor/create_plan" | "cursor/ask_question") => {
+                            if let Some(acp_id) = event.get("id").cloned() {
+                                self.acp.respond(
+                                    acp_id,
+                                    json!({"outcome": {"outcome": "cancelled", "reason": "ChatGPT Remote cannot safely represent this Cursor interaction"}})
+                                ).await?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }?;
+
+        if agent_started {
+            send_notification(
+                &writer,
+                "item/completed",
+                json!({
+                    "item": {
+                        "type": "agentMessage",
+                        "id": agent_item_id,
+                        "text": agent_text,
+                        "phase": null,
+                        "memoryCitation": null
+                    },
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": now_millis()
+                }),
+            )
+            .await?;
+        }
+        if reasoning_started {
+            send_notification(
+                &writer,
+                "item/completed",
+                json!({
+                    "item": {
+                        "type": "reasoning",
+                        "id": reasoning_item_id,
+                        "summary": [reasoning_text],
+                        "content": []
+                    },
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": now_millis()
+                }),
+            )
+            .await?;
+        }
+
+        let stop_reason = prompt_result
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or("end_turn");
+        let status = if stop_reason == "cancelled" {
+            "interrupted"
+        } else {
+            "completed"
+        };
+        let completed = turn_json(&turn_id, status, None);
+        send_notification(
+            &writer,
+            "turn/completed",
+            json!({"threadId": thread_id, "turn": completed}),
+        )
+        .await?;
+
+        let mut state = self.state.lock().await;
+        if let Some(thread) = state.threads.get_mut(&thread_id) {
+            thread.updated_at = now_seconds();
+            self.store.save(&state).await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_session_update(
+        &self,
+        writer: &RemoteWriter,
+        thread_id: &str,
+        turn_id: &str,
+        agent_item_id: &str,
+        reasoning_item_id: &str,
+        agent_started: &mut bool,
+        reasoning_started: &mut bool,
+        agent_text: &mut String,
+        reasoning_text: &mut String,
+        tools: &mut HashMap<String, Value>,
+        update: Value,
+    ) -> Result<()> {
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("agent_message_chunk") => {
+                let delta = update
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !*agent_started {
+                    *agent_started = true;
+                    send_notification(
+                        writer,
+                        "item/started",
+                        json!({
+                            "item": {
+                                "type": "agentMessage",
+                                "id": agent_item_id,
+                                "text": "",
+                                "phase": null,
+                                "memoryCitation": null
+                            },
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "startedAtMs": now_millis()
+                        }),
+                    )
+                    .await?;
+                }
+                agent_text.push_str(delta);
+                send_notification(
+                    writer,
+                    "item/agentMessage/delta",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": agent_item_id,
+                        "delta": delta
+                    }),
+                )
+                .await?;
+            }
+            Some("agent_thought_chunk") => {
+                let delta = update
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !*reasoning_started {
+                    *reasoning_started = true;
+                    send_notification(
+                        writer,
+                        "item/started",
+                        json!({
+                            "item": {
+                                "type": "reasoning",
+                                "id": reasoning_item_id,
+                                "summary": [],
+                                "content": []
+                            },
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "startedAtMs": now_millis()
+                        }),
+                    )
+                    .await?;
+                }
+                reasoning_text.push_str(delta);
+                send_notification(
+                    writer,
+                    "item/reasoning/summaryTextDelta",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": reasoning_item_id,
+                        "delta": delta,
+                        "summaryIndex": 0
+                    }),
+                )
+                .await?;
+            }
+            Some("tool_call" | "tool_call_update") => {
+                self.handle_tool_update(writer, thread_id, turn_id, tools, update)
+                    .await?;
+            }
+            Some("plan") => {
+                let steps = update
+                    .get("entries")
+                    .or_else(|| update.get("plan"))
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                json!({
+                                    "step": entry.get("content")
+                                        .or_else(|| entry.get("step"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Cursor plan step"),
+                                    "status": entry.get("status")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("pending")
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                send_notification(
+                    writer,
+                    "turn/plan/updated",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "explanation": null,
+                        "plan": steps
+                    }),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_tool_update(
+        &self,
+        writer: &RemoteWriter,
+        thread_id: &str,
+        turn_id: &str,
+        tools: &mut HashMap<String, Value>,
+        update: Value,
+    ) -> Result<()> {
+        let tool_id = update
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .context("ACP tool update omitted toolCallId")?
+            .to_owned();
+        let merged = tools.entry(tool_id.clone()).or_insert_with(|| json!({}));
+        merge_object(merged, &update);
+
+        let status = merged
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("in_progress");
+        let terminal = matches!(status, "completed" | "failed" | "cancelled");
+        let item = dynamic_tool_item(&tool_id, merged, terminal);
+        let method = if terminal {
+            "item/completed"
+        } else {
+            "item/started"
+        };
+        let time_key = if terminal {
+            "completedAtMs"
+        } else {
+            "startedAtMs"
+        };
+        send_notification(
+            writer,
+            method,
+            json!({
+                "item": item,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                time_key: now_millis()
+            }),
+        )
+        .await
+    }
+
+    async fn handle_permission(
+        &self,
+        connection_id: ConnectionId,
+        writer: &RemoteWriter,
+        thread_id: &str,
+        turn_id: &str,
+        event: &Value,
+    ) -> Result<()> {
+        let acp_id = event.get("id").cloned().context("ACP permission omitted id")?;
+        let params = event.get("params").cloned().unwrap_or_else(|| json!({}));
+        let title = permission_title(&params);
+        let kind = permission_kind(&params);
+        let item_id = params
+            .pointer("/toolCall/toolCallId")
+            .and_then(Value::as_str)
+            .map_or_else(|| Uuid::now_v7().to_string(), str::to_owned);
+        let mobile_id = self.next_mobile_id.fetch_add(1, Ordering::Relaxed);
+        let request_id = RequestId::Integer(mobile_id);
+        let (sender, receiver) = oneshot::channel();
+        self.mobile_requests.lock().await.insert(
+            mobile_id.to_string(),
+            PendingMobileRequest {
+                connection_id,
+                sender,
+            },
+        );
+
+        let method = if matches!(kind, "edit" | "delete" | "move") {
+            "item/fileChange/requestApproval"
+        } else {
+            "item/commandExecution/requestApproval"
+        };
+        let request_params = if method == "item/fileChange/requestApproval" {
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "startedAtMs": now_millis(),
+                "reason": title,
+                "grantRoot": null
+            })
+        } else {
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "startedAtMs": now_millis(),
+                "approvalId": null,
+                "environmentId": null,
+                "reason": title,
+                "networkApprovalContext": null,
+                "command": title,
+                "cwd": self.workspace,
+                "commandActions": [{"type": "unknown", "command": title}],
+                "additionalPermissions": null,
+                "proposedExecpolicyAmendment": null,
+                "proposedNetworkPolicyAmendments": null,
+                "availableDecisions": null
+            })
+        };
+
+        if let Err(err) = send_server_request(writer, request_id, method, request_params).await {
+            self.mobile_requests
+                .lock()
+                .await
+                .remove(&mobile_id.to_string());
+            self.acp
+                .respond(acp_id, acp_permission_result(&params, None))
+                .await?;
+            return Err(err);
+        }
+
+        let mobile_result = timeout(Duration::from_secs(300), receiver)
+            .await
+            .ok()
+            .and_then(std::result::Result::ok);
+        self.acp
+            .respond(
+                acp_id,
+                acp_permission_result(&params, mobile_result.as_ref()),
+            )
+            .await
+    }
+
+    async fn turn_interrupt(
+        &self,
+        id: RequestId,
+        params: Value,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let thread_id = required_string(&params, "threadId")?;
+        let persisted = self.persisted_thread(&thread_id).await?;
+        self.acp.cancel(&persisted.acp_session_id).await?;
+        send_response(&writer, id, json!({})).await
+    }
+
+    async fn persisted_thread(&self, thread_id: &str) -> Result<PersistedThread> {
+        self.state
+            .lock()
+            .await
+            .threads
+            .get(thread_id)
+            .cloned()
+            .with_context(|| format!("unknown thread {thread_id}"))
+    }
+
+    async fn thread_json(&self, thread_id: &str, include_turns: bool) -> Result<Value> {
+        let thread = self.persisted_thread(thread_id).await?;
+        Ok(json!({
+            "id": thread_id,
+            "extra": null,
+            "sessionId": thread_id,
+            "forkedFromId": null,
+            "parentThreadId": null,
+            "preview": "",
+            "ephemeral": false,
+            "historyMode": "legacy",
+            "modelProvider": "cursor",
+            "createdAt": thread.created_at,
+            "updatedAt": thread.updated_at,
+            "recencyAt": thread.updated_at,
+            "status": {"type": "idle"},
+            "path": null,
+            "cwd": thread.workspace,
+            "cliVersion": crate::BRIDGE_VERSION,
+            "source": "appServer",
+            "canAcceptDirectInput": true,
+            "threadSource": null,
+            "agentNickname": null,
+            "agentRole": null,
+            "gitInfo": null,
+            "name": null,
+            "turns": if include_turns { json!([]) } else { json!([]) }
+        }))
+    }
+
+    async fn resolve_mobile_request(&self, id: RequestId, result: Value) {
+        let key = request_id_key(&id);
+        if let Some(pending) = self.mobile_requests.lock().await.remove(&key) {
+            let _ = pending.sender.send(result);
+        }
+    }
+
+    async fn resolve_mobile_error(&self, error: JSONRPCError) {
+        let key = request_id_key(&error.id);
+        if let Some(pending) = self.mobile_requests.lock().await.remove(&key) {
+            let _ = pending.sender.send(json!({"decision": "decline"}));
+        }
+    }
+
+    pub async fn connection_closed(&self, connection_id: ConnectionId) {
+        let mut pending = self.mobile_requests.lock().await;
+        let keys: Vec<_> = pending
+            .iter()
+            .filter_map(|(key, request)| {
+                (request.connection_id == connection_id).then(|| key.clone())
+            })
+            .collect();
+        for key in keys {
+            pending.remove(&key);
+        }
+    }
+}
+
+fn request_id_key(id: &RequestId) -> String {
+    match id {
+        RequestId::Integer(value) => value.to_string(),
+        RequestId::String(value) => format!("s:{value}"),
+    }
+}
+
+fn required_string(params: &Value, key: &str) -> Result<String> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("missing string parameter {key}"))
+}
+
+fn extract_prompt(params: &Value) -> Result<String> {
+    let input = params
+        .get("input")
+        .and_then(Value::as_array)
+        .context("turn/start requires input array")?;
+    let text = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return Err(anyhow!("this POC currently accepts text input only"));
+    }
+    Ok(text)
+}
+
+fn turn_json(id: &str, status: &str, error: Option<String>) -> Value {
+    let now = now_seconds();
+    json!({
+        "id": id,
+        "items": [],
+        "itemsView": "full",
+        "status": status,
+        "error": error.map(|message| json!({
+            "message": message,
+            "codexErrorInfo": null,
+            "additionalDetails": null
+        })),
+        "startedAt": now,
+        "completedAt": if status == "inProgress" { Value::Null } else { json!(now) },
+        "durationMs": null
+    })
+}
+
+fn dynamic_tool_item(id: &str, update: &Value, terminal: bool) -> Value {
+    let title = update
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Cursor tool");
+    let failed = update
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "failed" | "cancelled"));
+    json!({
+        "type": "dynamicToolCall",
+        "id": id,
+        "namespace": "cursor",
+        "tool": title,
+        "arguments": update.get("rawInput").cloned().unwrap_or_else(|| json!({})),
+        "status": if terminal {
+            if failed { "failed" } else { "completed" }
+        } else {
+            "inProgress"
+        },
+        "contentItems": update.get("content").cloned(),
+        "success": if terminal { Some(!failed) } else { None },
+        "durationMs": null
+    })
+}
+
+fn merge_object(target: &mut Value, patch: &Value) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    if let Some(patch) = patch.as_object() {
+        for (key, value) in patch {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_extraction_joins_all_text_blocks() {
+        let prompt = extract_prompt(&json!({
+            "input": [
+                {"type": "text", "text": "first"},
+                {"type": "image", "url": "https://example.invalid/a.png"},
+                {"type": "text", "text": "second"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(prompt, "first\nsecond");
+    }
+
+    #[test]
+    fn tool_updates_preserve_prior_fields() {
+        let mut target = json!({"toolCallId": "x", "title": "Run tests"});
+        merge_object(&mut target, &json!({"status": "completed"}));
+        assert_eq!(target["title"], "Run tests");
+        assert_eq!(target["status"], "completed");
+    }
+
+    #[test]
+    fn completed_tool_item_is_fail_closed_on_cancel() {
+        let item = dynamic_tool_item(
+            "x",
+            &json!({"title": "write", "status": "cancelled"}),
+            true,
+        );
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["success"], false);
+    }
+}
+
