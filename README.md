@@ -88,9 +88,23 @@ connection settings.
 
 - App Server `initialize`
 - `thread/start`, `thread/resume`, `thread/read`, `thread/list`
-- `thread/compact/start` through an atomic Cursor ACP session rollover: the old
-  session produces a private handoff summary, a replacement session is seeded,
-  and the thread mapping changes only after both steps succeed
+- `thread/compact/start` through an atomic Cursor ACP session rollover. The
+  bridge harvests git status/diff/log and the latest `cursor/update_todos`
+  list, asks the old session for conversation-only YAML fields, overlays those
+  harvested facts, seeds a replacement session, and remaps the ChatGPT thread
+  only after both steps succeed. A pending `/compact-preview` capsule is reused
+  instead of summarizing again.
+- `/compact-preview` slash commands on ordinary `turn/start` messages. These
+  stay in the same ChatGPT thread and do not emit `thread/compacted`. Typing
+  `/compact` without `-preview` is forwarded to Cursor unchanged.
+
+  | Command | Effect |
+  | --- | --- |
+  | `/compact-preview` | Harvest git/todos, summarize conversation fields, store a pending capsule, and reply with YAML |
+  | `/compact-preview keep "…"` / `drop "…"` / `pin <path>` / `unpin <path>` | Update directives or pinned files and refresh the pending capsule |
+  | `/compact-preview set` plus YAML | Replace conversation fields without a second summary; git/todos stay harvested |
+  | `/compact-preview apply` | Rollover onto a replacement Cursor session |
+  | `/compact-preview cancel` | Discard the pending capsule and stay on the current session |
 - Read-only `thread/goal/get` compatibility (`goal: null`)
 - `turn/start`, `turn/interrupt`
 - Mobile bootstrap/config catalog responses required before a task can start
@@ -112,9 +126,13 @@ Known limitations:
   ChatGPT Remote cannot safely represent their full response schemas.
 - A resumed Cursor session may be unavailable even when the CLI advertised
   `loadSession`; the bridge creates a replacement ACP session in that case.
-- ACP v1 has no native context-compaction primitive. Manual compaction therefore
-  consumes two hidden Cursor turns (summary and replacement-session seeding),
-  times out after 120 seconds, and leaves the old mapping intact on failure.
+- ACP v1 has no native context-compaction primitive. ChatGPT Remote's Compact
+  button has no preview or edit UI. Official `thread/compact/start` is therefore
+  one-shot structured rollover. Preview, edit, apply, and cancel are ordinary
+  conversation turns using `/compact-preview`. Hidden summary turns cancel tool
+  calls, time out after 120 seconds, and leave the old mapping intact on
+  failure. Pending preview capsules live only in process memory and are dropped
+  if the bridge restarts.
 - `config/batchWrite` is acknowledged for mobile compatibility but does not
   mutate Codex or Cursor configuration; model, approval, and sandbox behavior
   remain the bridge's startup policy.
