@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use codex_app_server_protocol::{
-    JSONRPCNotification, JSONRPCRequest, JSONRPCErrorError, RequestId, ServerNotification,
+    JSONRPCErrorError, JSONRPCNotification, JSONRPCRequest, RequestId, ServerNotification,
     ServerNotificationEnvelope, ServerRequest,
 };
 use codex_app_server_transport::{
@@ -39,11 +39,7 @@ pub async fn send_error(
     .await
 }
 
-pub async fn send_notification(
-    writer: &RemoteWriter,
-    method: &str,
-    params: Value,
-) -> Result<()> {
+pub async fn send_notification(writer: &RemoteWriter, method: &str, params: Value) -> Result<()> {
     let notification = ServerNotification::try_from(JSONRPCNotification {
         method: method.to_owned(),
         params: Some(params),
@@ -129,4 +125,3 @@ mod tests {
         assert!(trace.contains("turn/start"));
     }
 }
-

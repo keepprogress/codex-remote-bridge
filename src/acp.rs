@@ -47,8 +47,14 @@ impl AcpClient {
             )
         })?;
         let stdin = child.stdin.take().context("Cursor ACP stdin unavailable")?;
-        let stdout = child.stdout.take().context("Cursor ACP stdout unavailable")?;
-        let stderr = child.stderr.take().context("Cursor ACP stderr unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Cursor ACP stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Cursor ACP stderr unavailable")?;
         let (events, _) = broadcast::channel(256);
 
         let inner = Arc::new(Inner {
@@ -230,8 +236,7 @@ impl AcpClient {
             .and_then(Value::as_array)
             .and_then(|modes| {
                 modes.iter().find_map(|mode| {
-                    (mode.get("id").and_then(Value::as_str) == Some("agent"))
-                        .then_some("agent")
+                    (mode.get("id").and_then(Value::as_str) == Some("agent")).then_some("agent")
                 })
             })
         {
@@ -277,7 +282,7 @@ fn id_key(id: &Value) -> String {
 }
 
 pub fn default_agent_path() -> PathBuf {
-    std::env::var_os("CURSOR_AGENT").map_or_else(
+    std::env::var_os("CURSOR_AGENT_BIN").map_or_else(
         || {
             std::env::var_os("HOME").map_or_else(
                 || PathBuf::from("agent"),
@@ -298,4 +303,3 @@ mod tests {
         assert_eq!(id_key(&json!("7")), "s:7");
     }
 }
-

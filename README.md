@@ -30,7 +30,8 @@ tokens. Pairing codes are printed only when `--pair` is requested.
 ## Requirements
 
 - Linux or WSL
-- Rust toolchain
+- Rust 1.95.0 (selected automatically by `rust-toolchain.toml`)
+- OpenSSL development headers (`libssl-dev` and `pkg-config` on Ubuntu/WSL)
 - Cursor Agent CLI, logged in with `agent login`
 - Codex CLI `0.145.0`, logged in with ChatGPT rather than an API key
 - ChatGPT Remote access on the same ChatGPT account/workspace
@@ -38,10 +39,10 @@ tokens. Pairing codes are printed only when `--pair` is requested.
 ## Build and diagnose
 
 ```bash
-cargo build --manifest-path codex-remote-bridge/Cargo.toml
+cd codex-remote-bridge
+cargo build
 
-cargo run --manifest-path codex-remote-bridge/Cargo.toml -- \
-  doctor --workspace /home/me/project --model auto
+cargo run -- doctor --workspace /home/me/project --model auto
 ```
 
 `doctor` checks executable versions, login status, the requested model, and the
@@ -53,7 +54,8 @@ Stop any other Codex remote-control daemon using the same enrollment first, then
 run:
 
 ```bash
-RUST_LOG=info cargo run --manifest-path codex-remote-bridge/Cargo.toml -- \
+cd codex-remote-bridge
+RUST_LOG=info cargo run -- \
   serve \
   --workspace /home/me/project \
   --model auto \
@@ -104,8 +106,9 @@ Known limitations:
 ## Test
 
 ```bash
-cargo fmt --manifest-path codex-remote-bridge/Cargo.toml --check
-cargo clippy --manifest-path codex-remote-bridge/Cargo.toml -- -D warnings
-cargo test --manifest-path codex-remote-bridge/Cargo.toml
+cd codex-remote-bridge
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 

@@ -3,12 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use codex_app_server_protocol::{
-    RemoteControlConnectionStatus, RemoteControlPairingStartParams,
-};
+use codex_app_server_protocol::{RemoteControlConnectionStatus, RemoteControlPairingStartParams};
 use codex_app_server_transport::{
-    ConnectionId, RemoteControlPolicy, RemoteControlStartConfig, RemoteControlStartupMode,
-    RemoteControlHandle, TransportEvent, start_remote_control,
+    ConnectionId, RemoteControlHandle, RemoteControlPolicy, RemoteControlStartConfig,
+    RemoteControlStartupMode, TransportEvent, start_remote_control,
 };
 use codex_login::{AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthManager};
 use codex_state::StateRuntime;
@@ -105,10 +103,7 @@ impl RemoteRuntime {
     pub async fn start_pairing(&self) -> Result<Value> {
         let response = self
             .handle
-            .start_pairing(
-                RemoteControlPairingStartParams { manual_code: true },
-                None,
-            )
+            .start_pairing(RemoteControlPairingStartParams { manual_code: true }, None)
             .await
             .context("cannot create remote-control pairing code")?;
         serde_json::to_value(response).context("cannot serialize pairing response")
@@ -169,8 +164,7 @@ pub fn default_codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME").map_or_else(
         || {
             std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
+                .map_or_else(|| PathBuf::from("."), PathBuf::from)
                 .join(".codex")
         },
         PathBuf::from,
@@ -181,11 +175,9 @@ pub fn default_bridge_home() -> PathBuf {
     std::env::var_os("CODEX_REMOTE_BRIDGE_HOME").map_or_else(
         || {
             std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
+                .map_or_else(|| PathBuf::from("."), PathBuf::from)
                 .join(".codex-remote-bridge")
         },
         PathBuf::from,
     )
 }
-

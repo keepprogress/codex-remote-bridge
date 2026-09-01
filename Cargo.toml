@@ -8,12 +8,16 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 codex-app-server-protocol = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 codex-app-server-transport = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 codex-login = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 codex-state = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
+# Keep prerelease Rama crates on the exact family captured by Codex's lockfile;
+# Cargo's normal caret resolution otherwise mixes them with incompatible 0.3.0.
+rama-error = "=0.3.0-alpha.4"
+rama-macros = "=0.3.0-alpha.4"
+rama-utils = "=0.3.0-alpha.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -27,5 +31,14 @@ tempfile = "3"
 
 [lints.clippy]
 all = "warn"
-pedantic = "warn"
+
+# Codex 0.145.0 enables proxy support that was carried in OpenAI's maintained
+# tungstenite forks at this tag. Git dependencies do not inherit the source
+# workspace's root patch table, so repeat the two relevant pins here.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 

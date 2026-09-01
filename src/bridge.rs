@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use codex_app_server_protocol::{
-    JSONRPCError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, RequestId,
+    JSONRPCError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, RequestId,
 };
 use codex_app_server_transport::ConnectionId;
 use serde_json::{Value, json};
@@ -76,9 +76,7 @@ impl Bridge {
                 self.handle_request(connection_id, request, writer.clone())
                     .await
             }
-            JSONRPCMessage::Notification(notification) => {
-                self.handle_notification(notification).await
-            }
+            JSONRPCMessage::Notification(notification) => self.handle_notification(notification),
             JSONRPCMessage::Response(response) => {
                 self.resolve_mobile_request(response.id, response.result)
                     .await;
@@ -94,7 +92,7 @@ impl Bridge {
         }
     }
 
-    async fn handle_notification(&self, notification: JSONRPCNotification) -> Result<()> {
+    fn handle_notification(&self, notification: JSONRPCNotification) -> Result<()> {
         match notification.method.as_str() {
             "initialized" => Ok(()),
             method => {
@@ -127,9 +125,7 @@ impl Bridge {
             "thread/resume" => self.thread_resume(id, params, writer).await,
             "thread/read" => self.thread_read(id, params, writer).await,
             "thread/list" => self.thread_list(id, writer).await,
-            "turn/start" => {
-                self.turn_start(connection_id, id, params, writer).await
-            }
+            "turn/start" => self.turn_start(connection_id, id, params, writer).await,
             "turn/interrupt" => self.turn_interrupt(id, params, writer).await,
             "turn/steer" => {
                 send_error(
@@ -260,12 +256,7 @@ impl Bridge {
         send_response(&writer, id, json!({"thread": thread})).await
     }
 
-    async fn thread_read(
-        &self,
-        id: RequestId,
-        params: Value,
-        writer: RemoteWriter,
-    ) -> Result<()> {
+    async fn thread_read(&self, id: RequestId, params: Value, writer: RemoteWriter) -> Result<()> {
         let thread_id = required_string(&params, "threadId")?;
         let include_turns = params
             .get("includeTurns")
@@ -393,7 +384,7 @@ impl Bridge {
 
         let prompt_result = loop {
             tokio::select! {
-                result = &mut prompt_request => break result,
+                biased;
                 event = events.recv() => {
                     let event = match event {
                         Ok(event) => event,
@@ -444,7 +435,8 @@ impl Bridge {
                         }
                         _ => {}
                     }
-                }
+                },
+                result = &mut prompt_request => break result,
             }
         }?;
 
@@ -673,22 +665,22 @@ impl Bridge {
         } else {
             "item/started"
         };
-        let time_key = if terminal {
-            "completedAtMs"
-        } else {
-            "startedAtMs"
-        };
-        send_notification(
-            writer,
-            method,
+        let params = if terminal {
             json!({
                 "item": item,
                 "threadId": thread_id,
                 "turnId": turn_id,
-                time_key: now_millis()
-            }),
-        )
-        .await
+                "completedAtMs": now_millis()
+            })
+        } else {
+            json!({
+                "item": item,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "startedAtMs": now_millis()
+            })
+        };
+        send_notification(writer, method, params).await
     }
 
     async fn handle_permission(
@@ -699,7 +691,10 @@ impl Bridge {
         turn_id: &str,
         event: &Value,
     ) -> Result<()> {
-        let acp_id = event.get("id").cloned().context("ACP permission omitted id")?;
+        let acp_id = event
+            .get("id")
+            .cloned()
+            .context("ACP permission omitted id")?;
         let params = event.get("params").cloned().unwrap_or_else(|| json!({}));
         let title = permission_title(&params);
         let kind = permission_kind(&params);
@@ -797,7 +792,7 @@ impl Bridge {
             .with_context(|| format!("unknown thread {thread_id}"))
     }
 
-    async fn thread_json(&self, thread_id: &str, include_turns: bool) -> Result<Value> {
+    async fn thread_json(&self, thread_id: &str, _include_turns: bool) -> Result<Value> {
         let thread = self.persisted_thread(thread_id).await?;
         Ok(json!({
             "id": thread_id,
@@ -823,7 +818,7 @@ impl Bridge {
             "agentRole": null,
             "gitInfo": null,
             "name": null,
-            "turns": if include_turns { json!([]) } else { json!([]) }
+            "turns": []
         }))
     }
 
@@ -845,9 +840,8 @@ impl Bridge {
         let mut pending = self.mobile_requests.lock().await;
         let keys: Vec<_> = pending
             .iter()
-            .filter_map(|(key, request)| {
-                (request.connection_id == connection_id).then(|| key.clone())
-            })
+            .filter(|(_, request)| request.connection_id == connection_id)
+            .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
             pending.remove(&key);
@@ -969,13 +963,8 @@ mod tests {
 
     #[test]
     fn completed_tool_item_is_fail_closed_on_cancel() {
-        let item = dynamic_tool_item(
-            "x",
-            &json!({"title": "write", "status": "cancelled"}),
-            true,
-        );
+        let item = dynamic_tool_item("x", &json!({"title": "write", "status": "cancelled"}), true);
         assert_eq!(item["status"], "failed");
         assert_eq!(item["success"], false);
     }
 }
-

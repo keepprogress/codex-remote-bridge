@@ -21,9 +21,9 @@ pub fn acp_permission_result(params: &Value, codex_result: Option<&Value>) -> Va
         .and_then(Value::as_array)
         .and_then(|options| {
             wanted_kinds.iter().find_map(|wanted| {
-                options.iter().find(|option| {
-                    option.get("kind").and_then(Value::as_str) == Some(*wanted)
-                })
+                options
+                    .iter()
+                    .find(|option| option.get("kind").and_then(Value::as_str) == Some(*wanted))
             })
         })
         .and_then(|option| option.get("optionId"))
@@ -76,13 +76,18 @@ mod tests {
     fn maps_accept_without_assuming_option_ids() {
         let result =
             acp_permission_result(&params(), Some(&serde_json::json!({"decision": "accept"})));
-        assert_eq!(result.pointer("/outcome/optionId"), Some(&Value::from("yes")));
+        assert_eq!(
+            result.pointer("/outcome/optionId"),
+            Some(&Value::from("yes"))
+        );
     }
 
     #[test]
     fn malformed_decision_fails_closed() {
         let result = acp_permission_result(&params(), None);
-        assert_eq!(result.pointer("/outcome/optionId"), Some(&Value::from("no")));
+        assert_eq!(
+            result.pointer("/outcome/optionId"),
+            Some(&Value::from("no"))
+        );
     }
 }
-

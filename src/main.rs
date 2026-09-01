@@ -24,8 +24,8 @@ enum Commands {
     Doctor {
         #[arg(long)]
         workspace: PathBuf,
-        #[arg(long, default_value_os_t = default_agent_path())]
-        agent_bin: PathBuf,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
         #[arg(long, default_value = "auto")]
         model: String,
     },
@@ -33,14 +33,14 @@ enum Commands {
     Serve {
         #[arg(long)]
         workspace: PathBuf,
-        #[arg(long, default_value_os_t = default_agent_path())]
-        agent_bin: PathBuf,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
         #[arg(long, default_value = "auto")]
         model: String,
-        #[arg(long, default_value_os_t = default_codex_home())]
-        codex_home: PathBuf,
-        #[arg(long, default_value_os_t = default_bridge_home())]
-        bridge_home: PathBuf,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        bridge_home: Option<PathBuf>,
         /// Print a short-lived code for pairing ChatGPT Remote.
         #[arg(long)]
         pair: bool,
@@ -64,7 +64,10 @@ async fn main() -> Result<()> {
             workspace,
             agent_bin,
             model,
-        } => doctor(&workspace, &agent_bin, &model).await,
+        } => {
+            let agent_bin = agent_bin.unwrap_or_else(default_agent_path);
+            doctor(&workspace, &agent_bin, &model).await
+        }
         Commands::Serve {
             workspace,
             agent_bin,
@@ -74,6 +77,9 @@ async fn main() -> Result<()> {
             pair,
             trace_wire,
         } => {
+            let agent_bin = agent_bin.unwrap_or_else(default_agent_path);
+            let codex_home = codex_home.unwrap_or_else(default_codex_home);
+            let bridge_home = bridge_home.unwrap_or_else(default_bridge_home);
             serve(
                 workspace,
                 agent_bin,
@@ -146,25 +152,50 @@ async fn doctor(workspace: &Path, agent_bin: &Path, model: &str) -> Result<()> {
         bail!("workspace is not a directory: {}", workspace.display());
     }
     if !agent_bin.exists() && agent_bin.components().count() > 1 {
-        bail!("Cursor agent binary does not exist: {}", agent_bin.display());
+        bail!(
+            "Cursor agent binary does not exist: {}",
+            agent_bin.display()
+        );
     }
 
     let version = run_checked(agent_bin, &["--version"]).await?;
+    run_checked(agent_bin, &["acp", "--help"])
+        .await
+        .context("Cursor Agent does not advertise ACP support")?;
     let models = run_checked(agent_bin, &["models"]).await?;
-    if model != "auto" && !models.lines().any(|line| line.starts_with(model)) {
+    if model != "auto" && !models.split_whitespace().any(|word| word == model) {
         bail!("Cursor model is not available: {model}");
     }
 
     let status = run_checked(agent_bin, &["status"]).await?;
+    if status.to_ascii_lowercase().contains("not logged in") {
+        bail!("Cursor Agent is not logged in");
+    }
+    let codex_version = run_checked(Path::new("codex"), &["--version"]).await?;
+    if !codex_version.contains("0.145.0") {
+        bail!(
+            "Codex CLI 0.145.0 is required by the pinned transport, found: {}",
+            one_line(&codex_version)
+        );
+    }
+    run_checked(
+        Path::new("codex"),
+        &["app-server", "--remote-control", "--help"],
+    )
+    .await
+    .context("Codex CLI does not accept the hidden Remote Control option")?;
+    let codex_status = run_checked(Path::new("codex"), &["login", "status"]).await?;
+    if codex_status.to_ascii_lowercase().contains("not logged in") {
+        bail!("Codex CLI is not logged in with ChatGPT");
+    }
+
     println!("Cursor Agent: {}", version.trim());
     println!("Cursor auth: {}", one_line(&status));
     println!("Cursor model: {model}");
     println!("Workspace: {}", workspace.display());
-
-    match run_checked(Path::new("codex"), &["login", "status"]).await {
-        Ok(status) => println!("Codex auth: {}", one_line(&status)),
-        Err(err) => println!("Codex auth: unavailable ({err})"),
-    }
+    println!("Codex CLI: {}", one_line(&codex_version));
+    println!("Codex auth: {}", one_line(&codex_status));
+    println!("Remote Control capability: available");
     println!("Credential values were not inspected or printed.");
     Ok(())
 }
@@ -207,4 +238,3 @@ fn print_pairing(pairing: &Value) {
     }
     println!("Enter this code in ChatGPT Remote. Treat it as a short-lived secret.");
 }
-

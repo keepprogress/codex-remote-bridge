@@ -6,4 +6,3 @@ pub mod rpc;
 pub mod state;
 
 pub const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
