@@ -39,7 +39,6 @@ tokens. Pairing codes are printed only when `--pair` is requested.
 ## Build and diagnose
 
 ```bash
-cd codex-remote-bridge
 cargo build
 
 cargo run -- doctor --workspace /home/me/project --model auto
@@ -54,7 +53,6 @@ Stop any other Codex remote-control daemon using the same enrollment first, then
 run:
 
 ```bash
-cd codex-remote-bridge
 RUST_LOG=info cargo run -- \
   serve \
   --workspace /home/me/project \
@@ -106,7 +104,6 @@ Known limitations:
 ## Test
 
 ```bash
-cd codex-remote-bridge
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
