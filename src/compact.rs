@@ -370,7 +370,6 @@ pub async fn harvest_git(workspace: &Path) -> GitState {
 pub fn modified_files_from_status(status_short: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in status_short.lines() {
-        let line = line.trim();
         if line.len() < 4 {
             continue;
         }

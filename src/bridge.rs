@@ -528,6 +528,7 @@ impl Bridge {
         if summary.trim().is_empty() {
             return Err(anyhow!("Cursor returned an empty compaction summary"));
         }
+        let todos = self.session_todos(&persisted.acp_session_id).await;
         let parsed = parse_capsule_yaml(&summary)?;
         Ok(overlay_harvested(parsed, git_state, todos, pinned_files))
     }

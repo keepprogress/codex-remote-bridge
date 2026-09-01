@@ -174,7 +174,7 @@ for line in sys.stdin:
                         }]
                     }
                 }), flush=True)
-            text = "from original session" if "continue" in incoming else summary
+            text = "from original session" if incoming.strip() == "continue" else summary
         else:
             replacement_prompt_count += 1
             if replacement_prompt_count == 1:
