@@ -118,6 +118,7 @@ async fn serve(
         Bridge::new(
             acp,
             workspace,
+            codex_home.clone(),
             model,
             StateStore::new(&bridge_home),
             trace_wire,

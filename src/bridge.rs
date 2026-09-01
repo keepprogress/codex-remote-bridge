@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use codex_app_server_protocol::{
     JSONRPCError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, RequestId,
+    SkillsExtraRootsSetResponse,
 };
 use codex_app_server_transport::ConnectionId;
 use serde_json::{Value, json};
@@ -16,24 +17,54 @@ use uuid::Uuid;
 
 use crate::acp::AcpClient;
 use crate::approval::{acp_permission_result, permission_kind, permission_title};
+use crate::compact::{
+    Capsule, CompactDirectives, CompactPreviewCommand, PendingCapsule, PinnedFile, PreviewArgs,
+    TodoItem, harvest_git, merge_todos, overlay_harvested, parse_capsule_yaml,
+    parse_compact_preview, pin_file, preview_message, seed_prompt, summary_prompt,
+    todos_from_event, unpin_directive, unpin_files,
+};
+use crate::process::ProcessManager;
 use crate::rpc::{
     RemoteWriter, now_millis, now_seconds, send_error, send_notification, send_response,
     send_server_request, trace_summary,
 };
 use crate::state::{PersistedState, PersistedThread, StateStore};
 
+struct PromptGuard<'a> {
+    active: &'a std::sync::Mutex<HashSet<String>>,
+    session_id: String,
+}
+
+impl Drop for PromptGuard<'_> {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session_id);
+    }
+}
+
 struct PendingMobileRequest {
     connection_id: ConnectionId,
     sender: oneshot::Sender<Value>,
 }
 
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
+const COMPACTION_SUMMARY_LIMIT: usize = 256 * 1024;
+
 pub struct Bridge {
     acp: AcpClient,
     workspace: PathBuf,
+    codex_home: PathBuf,
     model: String,
     store: StateStore,
     state: Mutex<PersistedState>,
     mobile_requests: Mutex<HashMap<String, PendingMobileRequest>>,
+    compactions: Mutex<HashSet<String>>,
+    pending_capsules: Mutex<HashMap<String, PendingCapsule>>,
+    todos: Mutex<HashMap<String, Vec<TodoItem>>>,
+    active_prompts: std::sync::Mutex<HashSet<String>>,
+    processes: ProcessManager,
     next_mobile_id: AtomicI64,
     trace_wire: bool,
 }
@@ -42,6 +73,7 @@ impl Bridge {
     pub async fn new(
         acp: AcpClient,
         workspace: PathBuf,
+        codex_home: PathBuf,
         model: String,
         store: StateStore,
         trace_wire: bool,
@@ -50,10 +82,16 @@ impl Bridge {
         Ok(Self {
             acp,
             workspace,
+            codex_home,
             model,
             store,
             state: Mutex::new(state),
             mobile_requests: Mutex::new(HashMap::new()),
+            compactions: Mutex::new(HashSet::new()),
+            pending_capsules: Mutex::new(HashMap::new()),
+            todos: Mutex::new(HashMap::new()),
+            active_prompts: std::sync::Mutex::new(HashSet::new()),
+            processes: ProcessManager::default(),
             next_mobile_id: AtomicI64::new(1_000_000),
             trace_wire,
         })
@@ -73,8 +111,23 @@ impl Bridge {
 
         let result = match message {
             JSONRPCMessage::Request(request) => {
-                self.handle_request(connection_id, request, writer.clone())
+                let request_id = request.id.clone();
+                match self
+                    .handle_request(connection_id, request, writer.clone())
                     .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        error!(%err, "bridge request failed before a usable response");
+                        send_error(
+                            &writer,
+                            request_id,
+                            -32_603,
+                            format!("bridge request failed: {err}"),
+                        )
+                        .await
+                    }
+                }
             }
             JSONRPCMessage::Notification(notification) => self.handle_notification(notification),
             JSONRPCMessage::Response(response) => {
@@ -112,11 +165,18 @@ impl Bridge {
         let params = request.params.unwrap_or_else(|| json!({}));
         match request.method.as_str() {
             "initialize" => {
+                let codex_home = self
+                    .codex_home
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.codex_home.clone());
                 send_response(
                     &writer,
                     id,
                     json!({
-                        "userAgent": format!("codex-remote-bridge/{}", crate::BRIDGE_VERSION)
+                        "userAgent": format!("codex-remote-bridge/{}", crate::BRIDGE_VERSION),
+                        "codexHome": codex_home,
+                        "platformFamily": std::env::consts::FAMILY,
+                        "platformOs": std::env::consts::OS,
                     }),
                 )
                 .await
@@ -125,6 +185,8 @@ impl Bridge {
             "thread/resume" => self.thread_resume(id, params, writer).await,
             "thread/read" => self.thread_read(id, params, writer).await,
             "thread/list" => self.thread_list(id, writer).await,
+            "thread/goal/get" => send_response(&writer, id, json!({"goal": null})).await,
+            "thread/compact/start" => self.thread_compact_start(id, params, writer).await,
             "turn/start" => self.turn_start(connection_id, id, params, writer).await,
             "turn/interrupt" => self.turn_interrupt(id, params, writer).await,
             "turn/steer" => {
@@ -136,26 +198,11 @@ impl Bridge {
                 )
                 .await
             }
-            "model/list" => {
-                send_response(
-                    &writer,
-                    id,
-                    json!({
-                        "data": [{
-                            "id": self.model,
-                            "model": self.model,
-                            "displayName": format!("Cursor {}", self.model),
-                            "description": "Cursor model pinned by codex-remote-bridge",
-                            "supportedReasoningEfforts": [],
-                            "defaultReasoningEffort": null,
-                            "isDefault": true
-                        }],
-                        "nextCursor": null
-                    }),
-                )
-                .await
+            "model/list" => send_response(&writer, id, model_list_result(&self.model)).await,
+            "skills/extraRoots/set" => {
+                send_response(&writer, id, protocol_json(&SkillsExtraRootsSetResponse {})).await
             }
-            "skills/list" | "app/list" | "mcpServer/list" => {
+            "skills/list" | "app/list" | "mcpServer/list" | "threadSection/list" => {
                 send_response(&writer, id, json!({"data": [], "nextCursor": null})).await
             }
             "config/read" => {
@@ -165,15 +212,101 @@ impl Bridge {
                     json!({
                         "config": {
                             "model": self.model,
-                            "cwd": self.workspace,
-                            "approvalPolicy": "on-request",
-                            "sandboxMode": "workspace-write"
+                            "model_provider": "cursor",
+                            "approval_policy": "on-request",
+                            "approvals_reviewer": "user",
+                            "sandbox_mode": "workspace-write"
                         },
-                        "origins": {}
+                        "origins": {},
+                        "layers": null
                     }),
                 )
                 .await
             }
+            "configRequirements/read" => {
+                send_response(&writer, id, json!({"requirements": null})).await
+            }
+            "collaborationMode/list" => {
+                send_response(
+                    &writer,
+                    id,
+                    json!({
+                        "data": [
+                            {
+                                "name": "Plan",
+                                "mode": "plan",
+                                "model": null,
+                                "reasoning_effort": "medium"
+                            },
+                            {
+                                "name": "Default",
+                                "mode": "default",
+                                "model": null
+                            }
+                        ]
+                    }),
+                )
+                .await
+            }
+            "plugin/installed" => {
+                send_response(
+                    &writer,
+                    id,
+                    json!({
+                        "marketplaces": [],
+                        "marketplaceLoadErrors": []
+                    }),
+                )
+                .await
+            }
+            "config/batchWrite" => {
+                let file_path = params
+                    .get("filePath")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.codex_home.join("config.toml"));
+                send_response(
+                    &writer,
+                    id,
+                    json!({
+                        "status": "ok",
+                        "version": "codex-remote-bridge",
+                        "filePath": file_path,
+                        "overriddenMetadata": null
+                    }),
+                )
+                .await
+            }
+            "process/spawn" => {
+                self.processes
+                    .spawn(connection_id, id, params, writer)
+                    .await
+            }
+            "process/writeStdin" => {
+                self.processes
+                    .write_stdin(connection_id, id, params, writer)
+                    .await
+            }
+            "process/kill" => self.processes.kill(connection_id, id, params, writer).await,
+            "process/resizePty" => {
+                self.processes
+                    .resize_pty(connection_id, id, params, writer)
+                    .await
+            }
+            "fs/createDirectory" => {
+                let path = PathBuf::from(required_string(&params, "path")?);
+                if params
+                    .get("recursive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                {
+                    tokio::fs::create_dir_all(&path).await?;
+                } else {
+                    tokio::fs::create_dir(&path).await?;
+                }
+                send_response(&writer, id, json!({})).await
+            }
+            "thread/unsubscribe" => send_response(&writer, id, json!({})).await,
             method => {
                 warn!(method, "remote client called unsupported method");
                 send_error(
@@ -280,6 +413,378 @@ impl Bridge {
         send_response(&writer, id, json!({"data": data, "nextCursor": null})).await
     }
 
+    async fn thread_compact_start(
+        self: &Arc<Self>,
+        id: RequestId,
+        params: Value,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let thread_id = required_string(&params, "threadId")?;
+        let persisted = self.persisted_thread(&thread_id).await?;
+        {
+            let mut compactions = self.compactions.lock().await;
+            if !compactions.insert(thread_id.clone()) {
+                return send_error(
+                    &writer,
+                    id,
+                    -32_001,
+                    format!("thread {thread_id} is already being compacted"),
+                )
+                .await;
+            }
+        }
+
+        let turn_id = Uuid::now_v7().to_string();
+        let item_id = Uuid::now_v7().to_string();
+        let turn = turn_json(&turn_id, "inProgress", None);
+        let item = json!({"type": "contextCompaction", "id": item_id});
+        let setup = async {
+            send_response(&writer, id, json!({})).await?;
+            send_notification(
+                &writer,
+                "turn/started",
+                json!({"threadId": thread_id, "turn": turn}),
+            )
+            .await?;
+            send_notification(
+                &writer,
+                "item/started",
+                json!({
+                    "item": item,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "startedAtMs": now_millis()
+                }),
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = setup {
+            self.compactions.lock().await.remove(&thread_id);
+            return Err(err);
+        }
+
+        let bridge = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = bridge.compact_cursor_session(&thread_id, &persisted).await;
+            bridge.compactions.lock().await.remove(&thread_id);
+
+            match result {
+                Ok(()) => {
+                    let _ = send_notification(
+                        &writer,
+                        "item/completed",
+                        json!({
+                            "item": item,
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "completedAtMs": now_millis()
+                        }),
+                    )
+                    .await;
+                    let _ = send_notification(
+                        &writer,
+                        "thread/compacted",
+                        json!({"threadId": thread_id, "turnId": turn_id}),
+                    )
+                    .await;
+                    let completed = turn_json(&turn_id, "completed", None);
+                    let _ = send_notification(
+                        &writer,
+                        "turn/completed",
+                        json!({"threadId": thread_id, "turn": completed}),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    error!(%err, %thread_id, %turn_id, "Cursor session compaction failed");
+                    let _ = send_notification(
+                        &writer,
+                        "item/completed",
+                        json!({
+                            "item": item,
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "completedAtMs": now_millis()
+                        }),
+                    )
+                    .await;
+                    let failed = turn_json(&turn_id, "failed", Some(err.to_string()));
+                    let _ = send_notification(
+                        &writer,
+                        "turn/completed",
+                        json!({"threadId": thread_id, "turn": failed}),
+                    )
+                    .await;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn compact_cursor_session(
+        &self,
+        thread_id: &str,
+        persisted: &PersistedThread,
+    ) -> Result<()> {
+        let pending = self
+            .pending_capsules
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|pending| pending.capsule.clone());
+        let capsule = match pending {
+            Some(capsule) => capsule,
+            None => {
+                self.build_capsule(persisted, &CompactDirectives::default(), Vec::new())
+                    .await?
+            }
+        };
+        self.commit_rollover(thread_id, persisted, &capsule).await?;
+        Ok(())
+    }
+
+    async fn build_capsule(
+        &self,
+        persisted: &PersistedThread,
+        directives: &CompactDirectives,
+        pinned_files: Vec<PinnedFile>,
+    ) -> Result<Capsule> {
+        let git_state = harvest_git(&persisted.workspace).await;
+        let todos = self.session_todos(&persisted.acp_session_id).await;
+        let prompt = summary_prompt(&git_state, &todos, directives)?;
+        let summary = self
+            .run_hidden_prompt(&persisted.acp_session_id, &prompt)
+            .await
+            .context("Cursor failed to summarize the existing session")?;
+        if summary.trim().is_empty() {
+            return Err(anyhow!("Cursor returned an empty compaction summary"));
+        }
+        let todos = self.session_todos(&persisted.acp_session_id).await;
+        let parsed = parse_capsule_yaml(&summary)?;
+        Ok(overlay_harvested(parsed, git_state, todos, pinned_files))
+    }
+
+    async fn commit_rollover(
+        &self,
+        thread_id: &str,
+        persisted: &PersistedThread,
+        capsule: &Capsule,
+    ) -> Result<String> {
+        let replacement_session = self.acp.new_session(&persisted.workspace).await?;
+        let seeded = self
+            .run_hidden_prompt(&replacement_session, &seed_prompt(capsule)?)
+            .await
+            .context("Cursor failed to seed the replacement session")?;
+        if seeded.trim() != "CONTEXT_READY" {
+            return Err(anyhow!(
+                "replacement Cursor session did not acknowledge compacted context"
+            ));
+        }
+
+        let mut state = self.state.lock().await;
+        let current = state
+            .threads
+            .get(thread_id)
+            .context("thread disappeared while compaction was running")?;
+        if current.acp_session_id != persisted.acp_session_id {
+            return Err(anyhow!(
+                "thread backend changed while compaction was running"
+            ));
+        }
+        let mut next_state = state.clone();
+        let replacement = next_state
+            .threads
+            .get_mut(thread_id)
+            .context("thread disappeared while committing compaction")?;
+        replacement.acp_session_id = replacement_session.clone();
+        replacement.updated_at = now_seconds();
+        self.store.save(&next_state).await?;
+        *state = next_state;
+        self.transfer_todos(&persisted.acp_session_id, &replacement_session)
+            .await;
+        self.pending_capsules.lock().await.remove(thread_id);
+        Ok(replacement_session)
+    }
+
+    async fn session_todos(&self, session_id: &str) -> Vec<TodoItem> {
+        self.todos
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn transfer_todos(&self, from: &str, to: &str) {
+        let mut todos = self.todos.lock().await;
+        if let Some(list) = todos.remove(from) {
+            todos.insert(to.to_owned(), list);
+        }
+    }
+
+    async fn ingest_todo_event(&self, fallback_session: &str, event: &Value) -> bool {
+        let params = event.get("params").cloned().unwrap_or(Value::Null);
+        let Some(session) = self.resolve_todo_session(fallback_session, &params) else {
+            return false;
+        };
+        let Some((merge, incoming)) = todos_from_event(&params) else {
+            return false;
+        };
+        let mut todos = self.todos.lock().await;
+        merge_todos(todos.entry(session.clone()).or_default(), incoming, merge);
+        session == fallback_session
+    }
+
+    fn resolve_todo_session(&self, fallback_session: &str, params: &Value) -> Option<String> {
+        if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
+            return Some(session.to_owned());
+        }
+        let active = self
+            .active_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.len() == 1 {
+            return active.iter().next().cloned();
+        }
+        if active.is_empty() {
+            return Some(fallback_session.to_owned());
+        }
+        warn!(
+            fallback_session,
+            active = active.len(),
+            "ignored sessionless cursor/update_todos while multiple ACP prompts are active"
+        );
+        None
+    }
+
+    fn enter_prompt(&self, session_id: &str) -> PromptGuard<'_> {
+        self.active_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_owned());
+        PromptGuard {
+            active: &self.active_prompts,
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    async fn take_todo_event(&self, session_id: &str, event: &Value) -> Result<()> {
+        let claimed = self.ingest_todo_event(session_id, event).await;
+        if claimed && let Some(acp_id) = event.get("id").cloned() {
+            self.acp.respond(acp_id, json!({})).await?;
+        }
+        Ok(())
+    }
+
+    async fn take_sessionless_todos(&self, session_id: &str, event: &Value) -> Result<()> {
+        if event.get("method").and_then(Value::as_str) != Some("cursor/update_todos") {
+            return Ok(());
+        }
+        if event
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.take_todo_event(session_id, event).await
+    }
+
+    async fn try_lock_compaction(&self, thread_id: &str) -> Result<()> {
+        let mut compactions = self.compactions.lock().await;
+        if !compactions.insert(thread_id.to_owned()) {
+            bail!("thread {thread_id} is already being compacted");
+        }
+        Ok(())
+    }
+
+    async fn unlock_compaction(&self, thread_id: &str) {
+        self.compactions.lock().await.remove(thread_id);
+    }
+
+    async fn run_hidden_prompt(&self, session_id: &str, prompt: &str) -> Result<String> {
+        let _prompt_guard = self.enter_prompt(session_id);
+        let mut events = self.acp.subscribe();
+        let request = self.acp.request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}]
+            }),
+        );
+        tokio::pin!(request);
+        let deadline = tokio::time::sleep(COMPACTION_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut text = String::new();
+
+        loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            return Err(anyhow!("Cursor ACP compaction event receiver lagged by {count}"));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(anyhow!("Cursor ACP event stream closed during compaction"));
+                        }
+                    };
+                    if !event_belongs_to_session(&event, session_id) {
+                        self.take_sessionless_todos(session_id, &event).await?;
+                        continue;
+                    }
+                    match event.get("method").and_then(Value::as_str) {
+                        Some("session/update") => {
+                            let update = event.pointer("/params/update").unwrap_or(&Value::Null);
+                            if update.get("sessionUpdate").and_then(Value::as_str)
+                                == Some("agent_message_chunk")
+                                && let Some(delta) = update.pointer("/content/text").and_then(Value::as_str)
+                            {
+                                text.push_str(delta);
+                                if text.len() > COMPACTION_SUMMARY_LIMIT {
+                                    self.acp.cancel(session_id).await?;
+                                    return Err(anyhow!(
+                                        "Cursor compaction output exceeded {COMPACTION_SUMMARY_LIMIT} bytes"
+                                    ));
+                                }
+                            }
+                        }
+                        Some("session/request_permission") => {
+                            if let Some(acp_id) = event.get("id").cloned() {
+                                self.acp.respond(
+                                    acp_id,
+                                    json!({"outcome": {"outcome": "cancelled", "reason": "tools are disabled during compaction"}}),
+                                ).await?;
+                            }
+                        }
+                        Some("cursor/create_plan" | "cursor/ask_question") => {
+                            if let Some(acp_id) = event.get("id").cloned() {
+                                self.acp.respond(
+                                    acp_id,
+                                    json!({"outcome": {"outcome": "cancelled", "reason": "interactive requests are disabled during compaction"}}),
+                                ).await?;
+                            }
+                        }
+                        Some("cursor/update_todos") => {
+                            self.take_todo_event(session_id, &event).await?;
+                        }
+                        _ => {}
+                    }
+                }
+                result = &mut request => {
+                    result?;
+                    return Ok(text);
+                }
+                _ = &mut deadline => {
+                    self.acp.cancel(session_id).await?;
+                    return Err(anyhow!("Cursor session compaction timed out after 120 seconds"));
+                }
+            }
+        }
+    }
+
     async fn turn_start(
         self: &Arc<Self>,
         connection_id: ConnectionId,
@@ -288,46 +793,102 @@ impl Bridge {
         writer: RemoteWriter,
     ) -> Result<()> {
         let thread_id = required_string(&params, "threadId")?;
+        if self.compactions.lock().await.contains(&thread_id) {
+            return send_error(
+                &writer,
+                id,
+                -32_001,
+                format!("thread {thread_id} is being compacted"),
+            )
+            .await;
+        }
         let persisted = self.persisted_thread(&thread_id).await?;
         let prompt = extract_prompt(&params)?;
+        let preview = parse_compact_preview(&prompt);
+        let preview_locked = matches!(
+            &preview,
+            Some(Ok(command)) if !matches!(command, CompactPreviewCommand::Cancel)
+        );
+        if preview_locked && let Err(err) = self.try_lock_compaction(&thread_id).await {
+            return send_error(&writer, id, -32_001, err.to_string()).await;
+        }
         let turn_id = Uuid::now_v7().to_string();
         let turn = turn_json(&turn_id, "inProgress", None);
-        send_response(&writer, id, json!({"turn": turn})).await?;
-        send_notification(
-            &writer,
-            "turn/started",
-            json!({"threadId": thread_id, "turn": turn}),
-        )
-        .await?;
+        let setup = async {
+            send_response(&writer, id, json!({"turn": turn})).await?;
+            send_notification(
+                &writer,
+                "turn/started",
+                json!({"threadId": thread_id, "turn": turn}),
+            )
+            .await?;
 
-        let user_item = json!({
-            "type": "userMessage",
-            "id": Uuid::now_v7().to_string(),
-            "clientId": params.get("clientUserMessageId").cloned().unwrap_or(Value::Null),
-            "content": params.get("input").cloned().unwrap_or_else(|| json!([]))
-        });
-        send_notification(
-            &writer,
-            "item/started",
-            json!({
-                "item": user_item,
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "startedAtMs": now_millis()
-            }),
-        )
-        .await?;
-        send_notification(
-            &writer,
-            "item/completed",
-            json!({
-                "item": user_item,
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "completedAtMs": now_millis()
-            }),
-        )
-        .await?;
+            let user_item = json!({
+                "type": "userMessage",
+                "id": Uuid::now_v7().to_string(),
+                "clientId": params.get("clientUserMessageId").cloned().unwrap_or(Value::Null),
+                "content": params.get("input").cloned().unwrap_or_else(|| json!([]))
+            });
+            send_notification(
+                &writer,
+                "item/started",
+                json!({
+                    "item": user_item,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "startedAtMs": now_millis()
+                }),
+            )
+            .await?;
+            send_notification(
+                &writer,
+                "item/completed",
+                json!({
+                    "item": user_item,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": now_millis()
+                }),
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = setup {
+            if preview_locked {
+                self.unlock_compaction(&thread_id).await;
+            }
+            return Err(err);
+        }
+
+        if let Some(parsed) = preview {
+            let bridge = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(err) = bridge
+                    .run_compact_preview_turn(
+                        persisted,
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        parsed,
+                        preview_locked,
+                        writer.clone(),
+                    )
+                    .await
+                {
+                    error!(%err, %thread_id, %turn_id, "compact preview turn failed");
+                    if preview_locked {
+                        bridge.unlock_compaction(&thread_id).await;
+                    }
+                    let failed = turn_json(&turn_id, "failed", Some(err.to_string()));
+                    let _ = send_notification(
+                        &writer,
+                        "turn/completed",
+                        json!({"threadId": thread_id, "turn": failed}),
+                    )
+                    .await;
+                }
+            });
+            return Ok(());
+        }
 
         let bridge = Arc::clone(self);
         tokio::spawn(async move {
@@ -355,6 +916,213 @@ impl Bridge {
         Ok(())
     }
 
+    async fn run_compact_preview_turn(
+        &self,
+        persisted: PersistedThread,
+        thread_id: String,
+        turn_id: String,
+        parsed: Result<CompactPreviewCommand>,
+        locked: bool,
+        writer: RemoteWriter,
+    ) -> Result<()> {
+        let command = match parsed {
+            Ok(command) => command,
+            Err(err) => {
+                return self
+                    .finish_local_turn(
+                        &writer,
+                        &thread_id,
+                        &turn_id,
+                        &format!("Compact preview failed: {err}"),
+                    )
+                    .await;
+            }
+        };
+        let message = match self
+            .execute_compact_preview(&thread_id, &persisted, command)
+            .await
+        {
+            Ok(text) => text,
+            Err(err) => format!("Compact preview failed: {err}"),
+        };
+        if locked {
+            self.unlock_compaction(&thread_id).await;
+        }
+        self.finish_local_turn(&writer, &thread_id, &turn_id, &message)
+            .await
+    }
+
+    async fn execute_compact_preview(
+        &self,
+        thread_id: &str,
+        persisted: &PersistedThread,
+        command: CompactPreviewCommand,
+    ) -> Result<String> {
+        match command {
+            CompactPreviewCommand::Cancel => {
+                self.pending_capsules.lock().await.remove(thread_id);
+                Ok("Compaction preview cancelled. The Cursor session was not rolled over.".into())
+            }
+            CompactPreviewCommand::Apply => {
+                let capsule = self
+                    .pending_capsules
+                    .lock()
+                    .await
+                    .get(thread_id)
+                    .map(|pending| pending.capsule.clone())
+                    .ok_or_else(|| {
+                        anyhow!("no pending compaction preview; run /compact-preview first")
+                    })?;
+                self.commit_rollover(thread_id, persisted, &capsule).await?;
+                Ok(
+                    "Compaction applied. This ChatGPT thread now maps to a replacement Cursor session."
+                        .into(),
+                )
+            }
+            CompactPreviewCommand::Set(yaml) => {
+                let parsed = parse_capsule_yaml(&yaml)?;
+                let git_state = harvest_git(&persisted.workspace).await;
+                let todos = self.session_todos(&persisted.acp_session_id).await;
+                let mut pending = self
+                    .pending_capsules
+                    .lock()
+                    .await
+                    .get(thread_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let capsule = overlay_harvested(
+                    parsed,
+                    git_state,
+                    todos,
+                    pending.capsule.pinned_files.clone(),
+                );
+                pending.capsule = capsule.clone();
+                self.pending_capsules
+                    .lock()
+                    .await
+                    .insert(thread_id.to_owned(), pending);
+                preview_message(&capsule)
+            }
+            CompactPreviewCommand::Preview(args) => {
+                self.refresh_preview(thread_id, persisted, args).await
+            }
+        }
+    }
+
+    async fn refresh_preview(
+        &self,
+        thread_id: &str,
+        persisted: &PersistedThread,
+        args: PreviewArgs,
+    ) -> Result<String> {
+        let previous = self.pending_capsules.lock().await.get(thread_id).cloned();
+        let had_pending = previous.is_some();
+        let mut pending = previous.unwrap_or_default();
+        pending.directives.merge(&CompactDirectives {
+            keep: args.keep.clone(),
+            drop: args.drop.clone(),
+            pins: args.pins.clone(),
+        });
+        for path in &args.unpins {
+            unpin_directive(&mut pending.directives.pins, &persisted.workspace, path);
+            unpin_files(
+                &mut pending.capsule.pinned_files,
+                &persisted.workspace,
+                path,
+            );
+        }
+
+        let mut pinned = pending.capsule.pinned_files.clone();
+        for path in &args.pins {
+            let file = pin_file(&persisted.workspace, path).await?;
+            unpin_files(&mut pinned, &persisted.workspace, &file.path);
+            pinned.push(file);
+        }
+
+        let rerun = !had_pending || args.conversation_changed();
+        let capsule = if rerun {
+            self.build_capsule(persisted, &pending.directives, pinned)
+                .await?
+        } else {
+            let git_state = harvest_git(&persisted.workspace).await;
+            let todos = self.session_todos(&persisted.acp_session_id).await;
+            overlay_harvested(pending.capsule, git_state, todos, pinned)
+        };
+        pending.capsule = capsule.clone();
+        self.pending_capsules
+            .lock()
+            .await
+            .insert(thread_id.to_owned(), pending);
+        preview_message(&capsule)
+    }
+
+    async fn finish_local_turn(
+        &self,
+        writer: &RemoteWriter,
+        thread_id: &str,
+        turn_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let item_id = Uuid::now_v7().to_string();
+        send_notification(
+            writer,
+            "item/started",
+            json!({
+                "item": {
+                    "type": "agentMessage",
+                    "id": item_id,
+                    "text": "",
+                    "phase": null,
+                    "memoryCitation": null
+                },
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "startedAtMs": now_millis()
+            }),
+        )
+        .await?;
+        send_notification(
+            writer,
+            "item/agentMessage/delta",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "delta": text
+            }),
+        )
+        .await?;
+        send_notification(
+            writer,
+            "item/completed",
+            json!({
+                "item": {
+                    "type": "agentMessage",
+                    "id": item_id,
+                    "text": text,
+                    "phase": null,
+                    "memoryCitation": null
+                },
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "completedAtMs": now_millis()
+            }),
+        )
+        .await?;
+        send_notification(
+            writer,
+            "turn/completed",
+            json!({"threadId": thread_id, "turn": turn_json(turn_id, "completed", None)}),
+        )
+        .await?;
+        let mut state = self.state.lock().await;
+        if let Some(thread) = state.threads.get_mut(thread_id) {
+            thread.updated_at = now_seconds();
+            self.store.save(&state).await?;
+        }
+        Ok(())
+    }
+
     async fn run_turn(
         &self,
         connection_id: ConnectionId,
@@ -364,6 +1132,7 @@ impl Bridge {
         prompt: String,
         writer: RemoteWriter,
     ) -> Result<()> {
+        let _prompt_guard = self.enter_prompt(&session_id);
         let mut events = self.acp.subscribe();
         let prompt_request = self.acp.request(
             "session/prompt",
@@ -396,7 +1165,8 @@ impl Bridge {
                             return Err(anyhow!("Cursor ACP event stream closed"));
                         }
                     };
-                    if event.pointer("/params/sessionId").and_then(Value::as_str) != Some(&session_id) {
+                    if !event_belongs_to_session(&event, &session_id) {
+                        self.take_sessionless_todos(&session_id, &event).await?;
                         continue;
                     }
                     match event.get("method").and_then(Value::as_str) {
@@ -432,6 +1202,9 @@ impl Bridge {
                                     json!({"outcome": {"outcome": "cancelled", "reason": "ChatGPT Remote cannot safely represent this Cursor interaction"}})
                                 ).await?;
                             }
+                        }
+                        Some("cursor/update_todos") => {
+                            self.take_todo_event(&session_id, &event).await?;
                         }
                         _ => {}
                     }
@@ -837,16 +1610,40 @@ impl Bridge {
     }
 
     pub async fn connection_closed(&self, connection_id: ConnectionId) {
-        let mut pending = self.mobile_requests.lock().await;
-        let keys: Vec<_> = pending
-            .iter()
-            .filter(|(_, request)| request.connection_id == connection_id)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in keys {
-            pending.remove(&key);
+        {
+            let mut pending = self.mobile_requests.lock().await;
+            let keys: Vec<_> = pending
+                .iter()
+                .filter(|(_, request)| request.connection_id == connection_id)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                pending.remove(&key);
+            }
         }
+        self.processes.connection_closed(connection_id).await;
     }
+}
+
+fn protocol_json<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value)
+        .unwrap_or_else(|err| panic!("protocol value should serialize: {err}"))
+}
+
+fn model_list_result(model: &str) -> Value {
+    json!({
+        "data": [{
+            "id": model,
+            "model": model,
+            "displayName": format!("Cursor {model}"),
+            "description": "Cursor model pinned by codex-remote-bridge",
+            "hidden": false,
+            "supportedReasoningEfforts": [],
+            "defaultReasoningEffort": "medium",
+            "isDefault": true
+        }],
+        "nextCursor": null
+    })
 }
 
 fn request_id_key(id: &RequestId) -> String {
@@ -862,6 +1659,10 @@ fn required_string(params: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .with_context(|| format!("missing string parameter {key}"))
+}
+
+fn event_belongs_to_session(event: &Value, session_id: &str) -> bool {
+    event.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
 }
 
 fn extract_prompt(params: &Value) -> Result<String> {

@@ -8,11 +8,13 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23.1"
 clap = { version = "4", features = ["derive"] }
 codex-app-server-protocol = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 codex-app-server-transport = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 codex-login = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 codex-state = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
+codex-utils-pty = { git = "https://github.com/openai/codex.git", tag = "rust-v0.145.0" }
 # Keep prerelease Rama crates on the exact family captured by Codex's lockfile;
 # Cargo's normal caret resolution otherwise mixes them with incompatible 0.3.0.
 rama-error = "=0.3.0-alpha.4"
@@ -20,6 +22,8 @@ rama-macros = "=0.3.0-alpha.4"
 rama-utils = "=0.3.0-alpha.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
@@ -41,4 +45,3 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 
 [patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
-
