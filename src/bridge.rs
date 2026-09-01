@@ -804,46 +804,63 @@ impl Bridge {
         }
         let persisted = self.persisted_thread(&thread_id).await?;
         let prompt = extract_prompt(&params)?;
+        let preview = parse_compact_preview(&prompt);
+        let preview_locked = matches!(
+            &preview,
+            Some(Ok(command)) if !matches!(command, CompactPreviewCommand::Cancel)
+        );
+        if preview_locked && let Err(err) = self.try_lock_compaction(&thread_id).await {
+            return send_error(&writer, id, -32_001, err.to_string()).await;
+        }
         let turn_id = Uuid::now_v7().to_string();
         let turn = turn_json(&turn_id, "inProgress", None);
-        send_response(&writer, id, json!({"turn": turn})).await?;
-        send_notification(
-            &writer,
-            "turn/started",
-            json!({"threadId": thread_id, "turn": turn}),
-        )
-        .await?;
+        let setup = async {
+            send_response(&writer, id, json!({"turn": turn})).await?;
+            send_notification(
+                &writer,
+                "turn/started",
+                json!({"threadId": thread_id, "turn": turn}),
+            )
+            .await?;
 
-        let user_item = json!({
-            "type": "userMessage",
-            "id": Uuid::now_v7().to_string(),
-            "clientId": params.get("clientUserMessageId").cloned().unwrap_or(Value::Null),
-            "content": params.get("input").cloned().unwrap_or_else(|| json!([]))
-        });
-        send_notification(
-            &writer,
-            "item/started",
-            json!({
-                "item": user_item,
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "startedAtMs": now_millis()
-            }),
-        )
-        .await?;
-        send_notification(
-            &writer,
-            "item/completed",
-            json!({
-                "item": user_item,
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "completedAtMs": now_millis()
-            }),
-        )
-        .await?;
+            let user_item = json!({
+                "type": "userMessage",
+                "id": Uuid::now_v7().to_string(),
+                "clientId": params.get("clientUserMessageId").cloned().unwrap_or(Value::Null),
+                "content": params.get("input").cloned().unwrap_or_else(|| json!([]))
+            });
+            send_notification(
+                &writer,
+                "item/started",
+                json!({
+                    "item": user_item,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "startedAtMs": now_millis()
+                }),
+            )
+            .await?;
+            send_notification(
+                &writer,
+                "item/completed",
+                json!({
+                    "item": user_item,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": now_millis()
+                }),
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = setup {
+            if preview_locked {
+                self.unlock_compaction(&thread_id).await;
+            }
+            return Err(err);
+        }
 
-        if let Some(parsed) = parse_compact_preview(&prompt) {
+        if let Some(parsed) = preview {
             let bridge = Arc::clone(self);
             tokio::spawn(async move {
                 if let Err(err) = bridge
@@ -852,11 +869,15 @@ impl Bridge {
                         thread_id.clone(),
                         turn_id.clone(),
                         parsed,
+                        preview_locked,
                         writer.clone(),
                     )
                     .await
                 {
                     error!(%err, %thread_id, %turn_id, "compact preview turn failed");
+                    if preview_locked {
+                        bridge.unlock_compaction(&thread_id).await;
+                    }
                     let failed = turn_json(&turn_id, "failed", Some(err.to_string()));
                     let _ = send_notification(
                         &writer,
@@ -901,6 +922,7 @@ impl Bridge {
         thread_id: String,
         turn_id: String,
         parsed: Result<CompactPreviewCommand>,
+        locked: bool,
         writer: RemoteWriter,
     ) -> Result<()> {
         let command = match parsed {
@@ -916,17 +938,6 @@ impl Bridge {
                     .await;
             }
         };
-        let lock = !matches!(command, CompactPreviewCommand::Cancel);
-        if lock && let Err(err) = self.try_lock_compaction(&thread_id).await {
-            return self
-                .finish_local_turn(
-                    &writer,
-                    &thread_id,
-                    &turn_id,
-                    &format!("Compact preview failed: {err}"),
-                )
-                .await;
-        }
         let message = match self
             .execute_compact_preview(&thread_id, &persisted, command)
             .await
@@ -934,7 +945,7 @@ impl Bridge {
             Ok(text) => text,
             Err(err) => format!("Compact preview failed: {err}"),
         };
-        if lock {
+        if locked {
             self.unlock_compaction(&thread_id).await;
         }
         self.finish_local_turn(&writer, &thread_id, &turn_id, &message)
