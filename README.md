@@ -27,6 +27,12 @@ The bridge reuses Codex's authentication loader and remote transport. It does
 not parse, copy, persist, or print ChatGPT OAuth and remote-control bearer
 tokens. Pairing codes are printed only when `--pair` is requested.
 
+App Server `process/spawn` is intentionally an unsandboxed host operation in
+the pinned Codex protocol. A paired controller can therefore execute arbitrary
+programs as the bridge user, including outside `--workspace`. Run the bridge
+only with a trusted ChatGPT account/controller and stop it when remote access is
+not needed.
+
 ## Requirements
 
 - Linux or WSL
@@ -82,7 +88,16 @@ connection settings.
 
 - App Server `initialize`
 - `thread/start`, `thread/resume`, `thread/read`, `thread/list`
+- `thread/compact/start` through an atomic Cursor ACP session rollover: the old
+  session produces a private handoff summary, a replacement session is seeded,
+  and the thread mapping changes only after both steps succeed
+- Read-only `thread/goal/get` compatibility (`goal: null`)
 - `turn/start`, `turn/interrupt`
+- Mobile bootstrap/config catalog responses required before a task can start
+- Connection-scoped `process/spawn`, `process/writeStdin`, `process/kill`, and
+  `process/resizePty`, including PTY mode, live output, output caps, timeouts,
+  duplicate-handle rejection, and disconnect cleanup
+- `fs/createDirectory` and `thread/unsubscribe`
 - Agent message, reasoning, plan, and generic tool-call events
 - Bidirectional command/file approvals with fail-closed timeout behavior
 - Cursor ACP v1 `initialize`, `authenticate`, session lifecycle, prompt,
@@ -97,6 +112,14 @@ Known limitations:
   ChatGPT Remote cannot safely represent their full response schemas.
 - A resumed Cursor session may be unavailable even when the CLI advertised
   `loadSession`; the bridge creates a replacement ACP session in that case.
+- ACP v1 has no native context-compaction primitive. Manual compaction therefore
+  consumes two hidden Cursor turns (summary and replacement-session seeding),
+  times out after 120 seconds, and leaves the old mapping intact on failure.
+- `config/batchWrite` is acknowledged for mobile compatibility but does not
+  mutate Codex or Cursor configuration; model, approval, and sandbox behavior
+  remain the bridge's startup policy.
+- The general App Server filesystem API is not implemented beyond
+  `fs/createDirectory`.
 - The ChatGPT mobile client's complete request set is not public. Unknown
   methods return JSON-RPC method-not-found and can be identified safely with
   `--trace-wire`.
@@ -108,4 +131,3 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
-
