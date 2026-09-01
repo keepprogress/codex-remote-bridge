@@ -21,7 +21,7 @@ use crate::compact::{
     Capsule, CompactDirectives, CompactPreviewCommand, PendingCapsule, PinnedFile, PreviewArgs,
     TodoItem, harvest_git, merge_todos, overlay_harvested, parse_capsule_yaml,
     parse_compact_preview, pin_file, preview_message, seed_prompt, summary_prompt,
-    todos_from_event, unpin_files,
+    todos_from_event, unpin_directive, unpin_files,
 };
 use crate::process::ProcessManager;
 use crate::rpc::{
@@ -29,6 +29,20 @@ use crate::rpc::{
     send_server_request, trace_summary,
 };
 use crate::state::{PersistedState, PersistedThread, StateStore};
+
+struct PromptGuard<'a> {
+    active: &'a std::sync::Mutex<HashSet<String>>,
+    session_id: String,
+}
+
+impl Drop for PromptGuard<'_> {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session_id);
+    }
+}
 
 struct PendingMobileRequest {
     connection_id: ConnectionId,
@@ -49,6 +63,7 @@ pub struct Bridge {
     compactions: Mutex<HashSet<String>>,
     pending_capsules: Mutex<HashMap<String, PendingCapsule>>,
     todos: Mutex<HashMap<String, Vec<TodoItem>>>,
+    active_prompts: std::sync::Mutex<HashSet<String>>,
     processes: ProcessManager,
     next_mobile_id: AtomicI64,
     trace_wire: bool,
@@ -75,6 +90,7 @@ impl Bridge {
             compactions: Mutex::new(HashSet::new()),
             pending_capsules: Mutex::new(HashMap::new()),
             todos: Mutex::new(HashMap::new()),
+            active_prompts: std::sync::Mutex::new(HashSet::new()),
             processes: ProcessManager::default(),
             next_mobile_id: AtomicI64::new(1_000_000),
             trace_wire,
@@ -482,6 +498,17 @@ impl Bridge {
                 }
                 Err(err) => {
                     error!(%err, %thread_id, %turn_id, "Cursor session compaction failed");
+                    let _ = send_notification(
+                        &writer,
+                        "item/completed",
+                        json!({
+                            "item": item,
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "completedAtMs": now_millis()
+                        }),
+                    )
+                    .await;
                     let failed = turn_json(&turn_id, "failed", Some(err.to_string()));
                     let _ = send_notification(
                         &writer,
@@ -500,9 +527,14 @@ impl Bridge {
         thread_id: &str,
         persisted: &PersistedThread,
     ) -> Result<()> {
-        let pending = self.pending_capsules.lock().await.remove(thread_id);
+        let pending = self
+            .pending_capsules
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|pending| pending.capsule.clone());
         let capsule = match pending {
-            Some(pending) => pending.capsule,
+            Some(capsule) => capsule,
             None => {
                 self.build_capsule(persisted, &CompactDirectives::default(), Vec::new())
                     .await?
@@ -591,21 +623,72 @@ impl Bridge {
         }
     }
 
-    async fn ingest_todo_event(&self, fallback_session: &str, event: &Value) {
+    async fn ingest_todo_event(&self, fallback_session: &str, event: &Value) -> bool {
         let params = event.get("params").cloned().unwrap_or(Value::Null);
-        let session = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or(fallback_session);
+        let Some(session) = self.resolve_todo_session(fallback_session, &params) else {
+            return false;
+        };
         let Some((merge, incoming)) = todos_from_event(&params) else {
-            return;
+            return false;
         };
         let mut todos = self.todos.lock().await;
-        merge_todos(
-            todos.entry(session.to_owned()).or_default(),
-            incoming,
-            merge,
+        merge_todos(todos.entry(session.clone()).or_default(), incoming, merge);
+        session == fallback_session
+    }
+
+    fn resolve_todo_session(&self, fallback_session: &str, params: &Value) -> Option<String> {
+        if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
+            return Some(session.to_owned());
+        }
+        let active = self
+            .active_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.len() == 1 {
+            return active.iter().next().cloned();
+        }
+        if active.is_empty() {
+            return Some(fallback_session.to_owned());
+        }
+        warn!(
+            fallback_session,
+            active = active.len(),
+            "ignored sessionless cursor/update_todos while multiple ACP prompts are active"
         );
+        None
+    }
+
+    fn enter_prompt(&self, session_id: &str) -> PromptGuard<'_> {
+        self.active_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_owned());
+        PromptGuard {
+            active: &self.active_prompts,
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    async fn take_todo_event(&self, session_id: &str, event: &Value) -> Result<()> {
+        let claimed = self.ingest_todo_event(session_id, event).await;
+        if claimed && let Some(acp_id) = event.get("id").cloned() {
+            self.acp.respond(acp_id, json!({})).await?;
+        }
+        Ok(())
+    }
+
+    async fn take_sessionless_todos(&self, session_id: &str, event: &Value) -> Result<()> {
+        if event.get("method").and_then(Value::as_str) != Some("cursor/update_todos") {
+            return Ok(());
+        }
+        if event
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.take_todo_event(session_id, event).await
     }
 
     async fn try_lock_compaction(&self, thread_id: &str) -> Result<()> {
@@ -621,6 +704,7 @@ impl Bridge {
     }
 
     async fn run_hidden_prompt(&self, session_id: &str, prompt: &str) -> Result<String> {
+        let _prompt_guard = self.enter_prompt(session_id);
         let mut events = self.acp.subscribe();
         let request = self.acp.request(
             "session/prompt",
@@ -648,6 +732,7 @@ impl Bridge {
                         }
                     };
                     if !event_belongs_to_session(&event, session_id) {
+                        self.take_sessionless_todos(session_id, &event).await?;
                         continue;
                     }
                     match event.get("method").and_then(Value::as_str) {
@@ -683,10 +768,7 @@ impl Bridge {
                             }
                         }
                         Some("cursor/update_todos") => {
-                            self.ingest_todo_event(session_id, &event).await;
-                            if let Some(acp_id) = event.get("id").cloned() {
-                                self.acp.respond(acp_id, json!({})).await?;
-                            }
+                            self.take_todo_event(session_id, &event).await?;
                         }
                         _ => {}
                     }
@@ -894,10 +976,15 @@ impl Bridge {
                     .pending_capsules
                     .lock()
                     .await
-                    .remove(thread_id)
+                    .get(thread_id)
+                    .cloned()
                     .unwrap_or_default();
-                let capsule =
-                    overlay_harvested(parsed, git_state, todos, pending.capsule.pinned_files);
+                let capsule = overlay_harvested(
+                    parsed,
+                    git_state,
+                    todos,
+                    pending.capsule.pinned_files.clone(),
+                );
                 pending.capsule = capsule.clone();
                 self.pending_capsules
                     .lock()
@@ -917,23 +1004,27 @@ impl Bridge {
         persisted: &PersistedThread,
         args: PreviewArgs,
     ) -> Result<String> {
-        let pending = self.pending_capsules.lock().await.remove(thread_id);
-        let had_pending = pending.is_some();
-        let mut pending = pending.unwrap_or_default();
+        let previous = self.pending_capsules.lock().await.get(thread_id).cloned();
+        let had_pending = previous.is_some();
+        let mut pending = previous.unwrap_or_default();
         pending.directives.merge(&CompactDirectives {
             keep: args.keep.clone(),
             drop: args.drop.clone(),
             pins: args.pins.clone(),
         });
         for path in &args.unpins {
-            pending.directives.pins.retain(|item| item != path);
-            unpin_files(&mut pending.capsule.pinned_files, path);
+            unpin_directive(&mut pending.directives.pins, &persisted.workspace, path);
+            unpin_files(
+                &mut pending.capsule.pinned_files,
+                &persisted.workspace,
+                path,
+            );
         }
 
-        let mut pinned = std::mem::take(&mut pending.capsule.pinned_files);
+        let mut pinned = pending.capsule.pinned_files.clone();
         for path in &args.pins {
             let file = pin_file(&persisted.workspace, path).await?;
-            unpin_files(&mut pinned, &file.path);
+            unpin_files(&mut pinned, &persisted.workspace, &file.path);
             pinned.push(file);
         }
 
@@ -1030,6 +1121,7 @@ impl Bridge {
         prompt: String,
         writer: RemoteWriter,
     ) -> Result<()> {
+        let _prompt_guard = self.enter_prompt(&session_id);
         let mut events = self.acp.subscribe();
         let prompt_request = self.acp.request(
             "session/prompt",
@@ -1063,6 +1155,7 @@ impl Bridge {
                         }
                     };
                     if !event_belongs_to_session(&event, &session_id) {
+                        self.take_sessionless_todos(&session_id, &event).await?;
                         continue;
                     }
                     match event.get("method").and_then(Value::as_str) {
@@ -1100,10 +1193,7 @@ impl Bridge {
                             }
                         }
                         Some("cursor/update_todos") => {
-                            self.ingest_todo_event(&session_id, &event).await;
-                            if let Some(acp_id) = event.get("id").cloned() {
-                                self.acp.respond(acp_id, json!({})).await?;
-                            }
+                            self.take_todo_event(&session_id, &event).await?;
                         }
                         _ => {}
                     }
@@ -1561,10 +1651,7 @@ fn required_string(params: &Value, key: &str) -> Result<String> {
 }
 
 fn event_belongs_to_session(event: &Value, session_id: &str) -> bool {
-    match event.pointer("/params/sessionId").and_then(Value::as_str) {
-        Some(found) => found == session_id,
-        None => event.get("method").and_then(Value::as_str) == Some("cursor/update_todos"),
-    }
+    event.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
 }
 
 fn extract_prompt(params: &Value) -> Result<String> {

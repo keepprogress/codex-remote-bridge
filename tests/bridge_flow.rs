@@ -123,7 +123,6 @@ fn fake_compaction_agent() -> (tempfile::TempDir, std::path::PathBuf) {
         r#"#!/usr/bin/env python3
 import json, os, sys
 session_count = 0
-replacement_prompt_count = 0
 before_prompt_count = 0
 here = os.path.dirname(os.path.abspath(__file__))
 emit_todos = os.path.exists(os.path.join(here, "emit_todos"))
@@ -175,18 +174,17 @@ for line in sys.stdin:
                     }
                 }), flush=True)
             text = "from original session" if incoming.strip() == "continue" else summary
-        else:
-            replacement_prompt_count += 1
-            if replacement_prompt_count == 1:
-                with open(os.path.join(here, "seed.log"), "w", encoding="utf-8") as fh:
-                    fh.write(incoming)
-                text = (
-                    "CONTEXT_READY"
-                    if "git_state" in incoming and "objective" in incoming
-                    else "MISSING_FIELDS"
-                )
+        elif "BEGIN COMPACTED CONTEXT" in incoming:
+            with open(os.path.join(here, "seed.log"), "w", encoding="utf-8") as fh:
+                fh.write(incoming)
+            if os.path.exists(os.path.join(here, "fail_seed")):
+                text = "MISSING_FIELDS"
+            elif "git_state" in incoming and "objective" in incoming:
+                text = "CONTEXT_READY"
             else:
-                text = "from replacement session"
+                text = "MISSING_FIELDS"
+        else:
+            text = "from replacement session"
         print(json.dumps({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -1161,6 +1159,208 @@ async fn compact_seed_includes_update_todos() {
     .expect("todo compact should complete");
     let seed = std::fs::read_to_string(agent_temp.path().join("seed.log")).unwrap();
     assert!(seed.contains("compare TAX_TYPE"), "{seed}");
+}
+
+#[tokio::test]
+async fn compact_failure_completes_item_and_keeps_pending_preview() {
+    let (agent_temp, agent) = fake_compaction_agent();
+    let state_temp = tempfile::tempdir().unwrap();
+    let acp = AcpClient::spawn(&agent, "auto", std::path::Path::new("/tmp"))
+        .await
+        .unwrap();
+    let bridge = Arc::new(
+        Bridge::new(
+            acp,
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp/codex-home"),
+            "auto".into(),
+            StateStore::new(state_temp.path()),
+            false,
+        )
+        .await
+        .unwrap(),
+    );
+    let (writer, mut receiver) = tokio::sync::mpsc::channel(64);
+    let connection = ConnectionId(16);
+
+    bridge
+        .handle(
+            connection,
+            request(1, "thread/start", json!({})),
+            writer.clone(),
+        )
+        .await;
+    let response = serde_json::to_value(receiver.recv().await.unwrap().message).unwrap();
+    let thread_id = response["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    receiver.recv().await.expect("thread/started notification");
+
+    bridge
+        .handle(
+            connection,
+            request(
+                2,
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "/compact-preview"}]
+                }),
+            ),
+            writer.clone(),
+        )
+        .await;
+    receiver.recv().await.expect("preview response");
+    collect_until_turn_completed(&mut receiver).await;
+
+    std::fs::write(agent_temp.path().join("fail_seed"), "").unwrap();
+    bridge
+        .handle(
+            connection,
+            request(3, "thread/compact/start", json!({"threadId": thread_id})),
+            writer.clone(),
+        )
+        .await;
+    receiver.recv().await.expect("compact response");
+    let mut completed_compaction_item = false;
+    let mut saw_compacted = false;
+    let mut failed = false;
+    timeout(Duration::from_secs(3), async {
+        while let Some(frame) = receiver.recv().await {
+            let value = serde_json::to_value(frame.message).unwrap();
+            let method = value.get("method").and_then(Value::as_str);
+            if method == Some("item/completed")
+                && value.pointer("/params/item/type") == Some(&Value::from("contextCompaction"))
+            {
+                completed_compaction_item = true;
+            }
+            if method == Some("thread/compacted") {
+                saw_compacted = true;
+            }
+            if method == Some("turn/completed") {
+                failed = value.pointer("/params/turn/status") == Some(&Value::from("failed"));
+                break;
+            }
+        }
+    })
+    .await
+    .expect("failed compact should finish");
+    assert!(failed);
+    assert!(completed_compaction_item);
+    assert!(!saw_compacted);
+
+    std::fs::remove_file(agent_temp.path().join("fail_seed")).unwrap();
+    bridge
+        .handle(
+            connection,
+            request(
+                4,
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "/compact-preview apply"}]
+                }),
+            ),
+            writer,
+        )
+        .await;
+    receiver.recv().await.expect("apply response");
+    let (_methods, applied, _) = collect_until_turn_completed(&mut receiver).await;
+    assert!(applied.contains("Compaction applied"), "{applied}");
+}
+
+#[tokio::test]
+async fn preview_survives_failed_pin() {
+    let (_agent_temp, agent) = fake_compaction_agent();
+    let state_temp = tempfile::tempdir().unwrap();
+    let acp = AcpClient::spawn(&agent, "auto", std::path::Path::new("/tmp"))
+        .await
+        .unwrap();
+    let bridge = Arc::new(
+        Bridge::new(
+            acp,
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp/codex-home"),
+            "auto".into(),
+            StateStore::new(state_temp.path()),
+            false,
+        )
+        .await
+        .unwrap(),
+    );
+    let (writer, mut receiver) = tokio::sync::mpsc::channel(64);
+    let connection = ConnectionId(17);
+
+    bridge
+        .handle(
+            connection,
+            request(1, "thread/start", json!({})),
+            writer.clone(),
+        )
+        .await;
+    let response = serde_json::to_value(receiver.recv().await.unwrap().message).unwrap();
+    let thread_id = response["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    receiver.recv().await.expect("thread/started notification");
+
+    bridge
+        .handle(
+            connection,
+            request(
+                2,
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "/compact-preview"}]
+                }),
+            ),
+            writer.clone(),
+        )
+        .await;
+    receiver.recv().await.expect("preview response");
+    collect_until_turn_completed(&mut receiver).await;
+
+    bridge
+        .handle(
+            connection,
+            request(
+                3,
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "/compact-preview pin missing-file.rs"}]
+                }),
+            ),
+            writer.clone(),
+        )
+        .await;
+    receiver.recv().await.expect("pin response");
+    let (_methods, pin_failed, _) = collect_until_turn_completed(&mut receiver).await;
+    assert!(
+        pin_failed.contains("Compact preview failed"),
+        "{pin_failed}"
+    );
+
+    bridge
+        .handle(
+            connection,
+            request(
+                4,
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "/compact-preview apply"}]
+                }),
+            ),
+            writer,
+        )
+        .await;
+    receiver.recv().await.expect("apply response");
+    let (_methods, applied, _) = collect_until_turn_completed(&mut receiver).await;
+    assert!(applied.contains("Compaction applied"), "{applied}");
 }
 
 #[tokio::test]

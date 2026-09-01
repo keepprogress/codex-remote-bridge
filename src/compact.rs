@@ -391,11 +391,7 @@ pub async fn pin_file(workspace: &Path, requested: &str) -> Result<PinnedFile> {
         .canonicalize()
         .context("cannot canonicalize workspace")?;
     let relative = resolved.strip_prefix(&workspace).unwrap_or(&resolved);
-    let display_path = if Path::new(requested).is_absolute() {
-        relative.to_string_lossy().into_owned()
-    } else {
-        requested.to_owned()
-    };
+    let display_path = relative.to_string_lossy().replace('\\', "/");
     let bytes = tokio::fs::read(&resolved)
         .await
         .with_context(|| format!("cannot read pinned file {display_path}"))?;
@@ -436,8 +432,30 @@ pub fn resolve_pin_path(workspace: &Path, requested: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-pub fn unpin_files(files: &mut Vec<PinnedFile>, path: &str) {
-    files.retain(|file| file.path != path);
+pub fn pin_key(workspace: &Path, requested: &str) -> String {
+    match resolve_pin_path(workspace, requested) {
+        Ok(resolved) => workspace
+            .canonicalize()
+            .ok()
+            .and_then(|root| {
+                resolved
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+            })
+            .unwrap_or_else(|| requested.to_owned()),
+        Err(_) => requested.to_owned(),
+    }
+}
+
+pub fn unpin_files(files: &mut Vec<PinnedFile>, workspace: &Path, requested: &str) {
+    let key = pin_key(workspace, requested);
+    files.retain(|file| file.path != key && file.path != requested);
+}
+
+pub fn unpin_directive(pins: &mut Vec<String>, workspace: &Path, requested: &str) {
+    let key = pin_key(workspace, requested);
+    pins.retain(|item| item != requested && item != &key);
 }
 
 async fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
@@ -613,6 +631,27 @@ next:\n  - inspect case03\n\
         assert!(err.to_string().contains("escapes workspace"), "{err}");
         let ok = resolve_pin_path(workspace.path(), "inside.txt").unwrap();
         assert!(ok.ends_with("inside.txt"));
+    }
+
+    #[tokio::test]
+    async fn unpin_matches_absolute_and_relative_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside.txt"), "ok").unwrap();
+        let pinned = pin_file(workspace.path(), "inside.txt").await.unwrap();
+        assert_eq!(pinned.path, "inside.txt");
+
+        let mut files = vec![pinned];
+        let absolute = workspace.path().join("inside.txt");
+        unpin_files(&mut files, workspace.path(), absolute.to_str().unwrap());
+        assert!(files.is_empty());
+
+        let pinned = pin_file(workspace.path(), absolute.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(pinned.path, "inside.txt");
+        let mut pins = vec!["inside.txt".into()];
+        unpin_directive(&mut pins, workspace.path(), absolute.to_str().unwrap());
+        assert!(pins.is_empty());
     }
 
     #[tokio::test]
